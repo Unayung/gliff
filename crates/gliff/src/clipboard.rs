@@ -17,7 +17,6 @@ use std::cell::{Cell, RefCell};
 use std::io;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::mpsc::Sender as StdSender;
 
 use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot, OnceCell};
@@ -66,7 +65,7 @@ struct RemoteOffer {
 pub struct Bridge {
     transfers: Transfers,
     jobs: Jobs,
-    status: StdSender<Status>,
+    status: crate::wake::Sender<Status>,
     /// None until a local selection has been offered. Serial zero is a
     /// valid wire value, so it must not stand in for an absent offer.
     local_serial: Cell<Option<u32>>,
@@ -76,7 +75,7 @@ pub struct Bridge {
 }
 
 impl Bridge {
-    pub fn new(transfers: Transfers, status: StdSender<Status>) -> Self {
+    pub fn new(transfers: Transfers, status: crate::wake::Sender<Status>) -> Self {
         let report_to = status.clone();
         Self {
             transfers,
@@ -276,7 +275,7 @@ mod tests {
             .unwrap();
         tokio::task::LocalSet::new().block_on(&rt, async {
             let (out, mut rx) = outbound_channel();
-            let (status_tx, status_rx) = std::sync::mpsc::channel();
+            let (status_tx, status_rx) = crate::wake::channel();
             let bridge = Bridge::new(Transfers::new(out, Side::Client), status_tx);
             for (id, item) in [
                 (2, ClipboardItem::Mime("text/plain".into())),
@@ -308,7 +307,7 @@ mod tests {
             .unwrap();
         tokio::task::LocalSet::new().block_on(&rt, async {
             let (out, mut rx) = outbound_channel();
-            let (status_tx, status_rx) = std::sync::mpsc::channel();
+            let (status_tx, status_rx) = crate::wake::channel();
             let bridge = Bridge::new(Transfers::new(out, Side::Client), status_tx);
             for (serial, offered, requested, allowed) in [
                 (1, "text/plain", "text/uri-list", false),
@@ -364,7 +363,7 @@ mod tests {
             .unwrap();
         tokio::task::LocalSet::new().block_on(&rt, async {
             let (out, mut rx) = outbound_channel();
-            let (status_tx, status_rx) = std::sync::mpsc::channel();
+            let (status_tx, status_rx) = crate::wake::channel();
             let bridge = Bridge::new(Transfers::new(out, Side::Client), status_tx);
             bridge.on_ui(ToWorker::LocalOffer {
                 mime_types: vec!["text/plain".into()],

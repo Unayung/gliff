@@ -6,7 +6,6 @@
 //! and plain values cross to the GTK thread.
 
 use std::rc::Rc;
-use std::sync::mpsc::{Sender as StdSender, SyncSender};
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -26,6 +25,7 @@ use tokio::sync::mpsc::{self, unbounded_channel, UnboundedReceiver};
 use crate::clipboard::{Bridge, ToWorker};
 use crate::gpu::{self, Decoder, DisplayFrame, Gpu};
 use crate::keymap::{Keymap, FIRST_KEYMAP_WAIT};
+use crate::wake;
 
 /// Stream geometry one picture was configured under: stream size, view
 /// size, and the effective scale x1000.
@@ -127,8 +127,8 @@ pub struct Worker {
     pub video: VideoMode,
     /// Bounded so a stalled UI thread cannot make the decoder buffer frames
     /// without limit; when full, the newest frame is dropped (latest-wins).
-    pub frames: SyncSender<Picture>,
-    pub status: StdSender<Status>,
+    pub frames: wake::SyncSender<Picture>,
+    pub status: wake::Sender<Status>,
     pub input: UnboundedReceiver<ToWorker>,
     pub keymap: Keymap,
 }
@@ -264,8 +264,8 @@ async fn session<R, W>(
     rd: R,
     wr: W,
     video: VideoMode,
-    frames: SyncSender<Picture>,
-    status: StdSender<Status>,
+    frames: wake::SyncSender<Picture>,
+    status: wake::Sender<Status>,
     mut input: UnboundedReceiver<ToWorker>,
     mut keymap: Keymap,
 ) -> anyhow::Result<()>

@@ -15,12 +15,13 @@ mod net;
 mod paintable;
 mod recent;
 mod theme;
+mod wake;
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::mpsc::{channel, sync_channel, Receiver};
+
 use std::time::{Duration, Instant};
 
 use adw::prelude::*;
@@ -995,8 +996,8 @@ fn show_disconnected(ui: &Rc<App>, s: &Rc<Session>) {
 /// Start a worker for the session. Each call is a new generation; pollers
 /// and reconnects from an older one stop themselves.
 fn start_session(ui: Rc<App>, s: Rc<Session>) {
-    let (frame_tx, frame_rx) = sync_channel::<Picture>(2);
-    let (status_tx, status_rx) = channel::<Status>();
+    let (frame_tx, frame_rx) = wake::sync_channel::<Picture>(2);
+    let (status_tx, status_rx) = wake::channel::<Status>();
     let (input_tx, input_rx) = unbounded_channel::<clipboard::ToWorker>();
     // Replacing the sender closes the old worker's input, which ends it.
     *s.input_tx.borrow_mut() = Some(input_tx);
@@ -1063,43 +1064,49 @@ fn schedule_reconnect(ui: Rc<App>, s: Rc<Session>, generation: u64) {
 
 /// Pull decoded frames on the GTK main loop, latest-wins. The shown session
 /// paints them; every session keeps its latest for when its tab is shown.
-fn poll_frames(ui: Rc<App>, s: Rc<Session>, rx: Receiver<Picture>, generation: u64) {
-    glib::timeout_add_local(Duration::from_millis(8), move || {
-        if s.generation.get() != generation {
-            return glib::ControlFlow::Break;
-        }
-        let mut latest = None;
+fn poll_frames(ui: Rc<App>, s: Rc<Session>, rx: wake::Receiver<Picture>, generation: u64) {
+    glib::spawn_future_local(async move {
         loop {
-            match rx.try_recv() {
-                Ok(f) => latest = Some(f),
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                // The worker ended; stop this per-session timer so it does not
-                // accumulate across reconnects.
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    return glib::ControlFlow::Break
+            rx.ready().await;
+            if s.generation.get() != generation {
+                return;
+            }
+            let mut latest = None;
+            loop {
+                match rx.try_recv() {
+                    Ok(f) => latest = Some(f),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    // The worker ended; stop so waiters do not accumulate
+                    // across reconnects.
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
                 }
             }
-        }
-        if let Some(p) = latest {
-            match frame_texture(p.frame) {
-                Ok(texture) => {
-                    // Geometry follows the frame that really paints, so the
-                    // pointer never maps against a picture that is not on
-                    // screen (a newer config, or a failed import).
-                    s.stream_size.set(p.stream);
-                    s.stream_view.set(p.view);
-                    s.stream_scale.set((p.scale_milli.max(1) as f32) / 1000.0);
-                    if is_active(&ui, &s) {
-                        ui.frame
-                            .set_frame(texture.clone(), device_scale(&ui), p.view);
-                    }
-                    *s.last_frame.borrow_mut() = Some((texture, p.view));
-                }
-                Err(e) => tracing::warn!(error = %e, "frame texture import failed"),
+            if let Some(p) = latest {
+                show_picture(&ui, &s, p);
             }
         }
-        glib::ControlFlow::Continue
     });
+}
+
+/// Put a decoded frame up as the session's latest, and on screen when the
+/// session is shown.
+fn show_picture(ui: &App, s: &Rc<Session>, p: Picture) {
+    match frame_texture(p.frame) {
+        Ok(texture) => {
+            // Geometry follows the frame that really paints, so the pointer
+            // never maps against a picture that is not on screen (a newer
+            // config, or a failed import).
+            s.stream_size.set(p.stream);
+            s.stream_view.set(p.view);
+            s.stream_scale.set((p.scale_milli.max(1) as f32) / 1000.0);
+            if is_active(ui, s) {
+                ui.frame
+                    .set_frame(texture.clone(), device_scale(ui), p.view);
+            }
+            *s.last_frame.borrow_mut() = Some((texture, p.view));
+        }
+        Err(e) => tracing::warn!(error = %e, "frame texture import failed"),
+    }
 }
 
 /// Wrap a decoded frame as a GDK texture: a dmabuf import for the GPU tier,
@@ -1168,137 +1175,153 @@ fn gpu_texture(f: gpu::DisplayFrame) -> Result<gdk::Texture, glib::Error> {
     }
 }
 
-fn poll_status(ui: Rc<App>, s: Rc<Session>, rx: Receiver<Status>, generation: u64) {
-    glib::timeout_add_local(Duration::from_millis(100), move || {
-        if s.generation.get() != generation {
-            return glib::ControlFlow::Break;
+fn poll_status(ui: Rc<App>, s: Rc<Session>, rx: wake::Receiver<Status>, generation: u64) {
+    glib::spawn_future_local(async move {
+        loop {
+            rx.ready().await;
+            if handle_statuses(&ui, &s, &rx, generation) == glib::ControlFlow::Break {
+                return;
+            }
         }
-        while let Ok(status) = rx.try_recv() {
-            match status {
-                // Pointer-mapping geometry (stream_size/view/scale) is not
-                // read from the config: it follows each decoded frame, so a
-                // new config never remaps clicks against the old picture.
-                Status::Connected {
-                    video,
-                    view_width,
-                    view_height,
-                    fps_cap,
-                    headless,
-                } => {
-                    s.server_view.set((view_width, view_height));
-                    s.fps_cap.set(fps_cap);
-                    s.headless.set(headless);
-                    s.resize_requested.set((0, 0));
-                    s.retries.set(0);
-                    s.gave_up.set(false);
-                    if !s.connected.replace(true) {
-                        refresh_tabs(&ui);
-                    }
-                    set_status(&ui, &s, "");
-                    // Visible before the first per-second stats arrive.
-                    set_stats(&ui, &s, &video);
-                    remember_machine(&ui, &s);
-                    // A fresh server starts at its own default size; a
-                    // reconnect must bring it back to the window. The gate
-                    // compares against the view, so a server-chosen
-                    // reduced-resolution stream never triggers one. A
-                    // background session is resized when it is shown.
-                    if is_active(&ui, &s) {
-                        request_resize(&ui);
-                        if headless && s.cursor.borrow().is_none() {
-                            let cursor = hidden_cursor();
-                            ui.video.set_cursor(Some(&cursor));
-                            *s.cursor.borrow_mut() = Some(cursor);
-                        }
+    });
+}
+
+/// Act on every status waiting from the session's worker. `Break` when the
+/// worker is done with this generation.
+fn handle_statuses(
+    ui: &Rc<App>,
+    s: &Rc<Session>,
+    rx: &wake::Receiver<Status>,
+    generation: u64,
+) -> glib::ControlFlow {
+    if s.generation.get() != generation {
+        return glib::ControlFlow::Break;
+    }
+    while let Ok(status) = rx.try_recv() {
+        match status {
+            // Pointer-mapping geometry (stream_size/view/scale) is not
+            // read from the config: it follows each decoded frame, so a
+            // new config never remaps clicks against the old picture.
+            Status::Connected {
+                video,
+                view_width,
+                view_height,
+                fps_cap,
+                headless,
+            } => {
+                s.server_view.set((view_width, view_height));
+                s.fps_cap.set(fps_cap);
+                s.headless.set(headless);
+                s.resize_requested.set((0, 0));
+                s.retries.set(0);
+                s.gave_up.set(false);
+                if !s.connected.replace(true) {
+                    refresh_tabs(ui);
+                }
+                set_status(ui, s, "");
+                // Visible before the first per-second stats arrive.
+                set_stats(ui, s, &video);
+                remember_machine(ui, s);
+                // A fresh server starts at its own default size; a
+                // reconnect must bring it back to the window. The gate
+                // compares against the view, so a server-chosen
+                // reduced-resolution stream never triggers one. A
+                // background session is resized when it is shown.
+                if is_active(ui, s) {
+                    request_resize(ui);
+                    if headless && s.cursor.borrow().is_none() {
+                        let cursor = hidden_cursor();
+                        ui.video.set_cursor(Some(&cursor));
+                        *s.cursor.borrow_mut() = Some(cursor);
                     }
                 }
-                Status::Stats {
-                    fps,
-                    mbit,
-                    decode_ms,
-                    video,
-                } => {
-                    let (sw, sh) = s.stream_size.get();
-                    let (vw, vh) = s.stream_view.get();
-                    let stream = if (sw, sh) == (vw, vh) {
-                        format!("{sw}x{sh}")
-                    } else {
-                        format!("{sw}x{sh} → {vw}x{vh}")
-                    };
-                    let cap = s.fps_cap.get();
-                    set_stats(
-                        &ui,
-                        &s,
+            }
+            Status::Stats {
+                fps,
+                mbit,
+                decode_ms,
+                video,
+            } => {
+                let (sw, sh) = s.stream_size.get();
+                let (vw, vh) = s.stream_view.get();
+                let stream = if (sw, sh) == (vw, vh) {
+                    format!("{sw}x{sh}")
+                } else {
+                    format!("{sw}x{sh} → {vw}x{vh}")
+                };
+                let cap = s.fps_cap.get();
+                set_stats(
+                        ui,
+                        s,
                         &format!(
                             "{video}  {fps:.0} fps  {mbit:.1} Mbit/s  decode {decode_ms:.1} ms  {stream} @{cap}"
                         ),
                     );
-                }
-                Status::Cursor {
+            }
+            Status::Cursor {
+                width,
+                height,
+                hot_x,
+                hot_y,
+                argb,
+            } => set_remote_cursor(
+                ui,
+                s,
+                CursorImage {
                     width,
                     height,
                     hot_x,
                     hot_y,
-                    argb,
-                } => set_remote_cursor(
-                    &ui,
-                    &s,
-                    CursorImage {
-                        width,
-                        height,
-                        hot_x,
-                        hot_y,
-                        argb: &argb,
-                    },
-                ),
-                // Only the shown machine may take over the local clipboard.
-                Status::ClipboardOffer {
-                    serial,
-                    mime_types,
-                    files,
-                } => {
-                    if !ui.cli.no_clipboard && is_active(&ui, &s) {
-                        if let Some(tx) = s.input_tx.borrow().as_ref() {
-                            clipboard_ui::set_remote_offer(tx, serial, mime_types, files);
-                        }
+                    argb: &argb,
+                },
+            ),
+            // Only the shown machine may take over the local clipboard.
+            Status::ClipboardOffer {
+                serial,
+                mime_types,
+                files,
+            } => {
+                if !ui.cli.no_clipboard && is_active(ui, s) {
+                    if let Some(tx) = s.input_tx.borrow().as_ref() {
+                        clipboard_ui::set_remote_offer(tx, serial, mime_types, files);
                     }
-                }
-                Status::ClipboardRead { mime_type, reply } => {
-                    if !ui.cli.no_clipboard {
-                        clipboard_ui::read_local(mime_type, reply)
-                    }
-                }
-                Status::ClipboardTransfer { id, progress } => {
-                    let cancel_via = s.clone();
-                    ui.transfers.update(id, &progress, move |id| {
-                        if let Some(tx) = cancel_via.input_tx.borrow().clone() {
-                            let _ = tx.send(clipboard::ToWorker::CancelTransfer(id));
-                        }
-                    });
-                }
-                Status::Error(e) => {
-                    tracing::error!(machine = %s.name, error = %e, "connection failed");
-                    set_status(&ui, &s, &format!("Error: {e}"));
-                    show_disconnected(&ui, &s);
-                    schedule_reconnect(ui.clone(), s.clone(), generation);
-                    return glib::ControlFlow::Break;
-                }
-                Status::Incompatible(message) => {
-                    tracing::error!(machine = %s.name, error = %message, "incompatible server");
-                    set_status(&ui, &s, &message);
-                    show_disconnected(&ui, &s);
-                    s.gave_up.set(true);
-                    return glib::ControlFlow::Break;
-                }
-                Status::Closed => {
-                    show_disconnected(&ui, &s);
-                    schedule_reconnect(ui.clone(), s.clone(), generation);
-                    return glib::ControlFlow::Break;
                 }
             }
+            Status::ClipboardRead { mime_type, reply } => {
+                if !ui.cli.no_clipboard {
+                    clipboard_ui::read_local(mime_type, reply)
+                }
+            }
+            Status::ClipboardTransfer { id, progress } => {
+                let cancel_via = s.clone();
+                ui.transfers.update(id, &progress, move |id| {
+                    if let Some(tx) = cancel_via.input_tx.borrow().clone() {
+                        let _ = tx.send(clipboard::ToWorker::CancelTransfer(id));
+                    }
+                });
+            }
+            Status::Error(e) => {
+                tracing::error!(machine = %s.name, error = %e, "connection failed");
+                set_status(ui, s, &format!("Error: {e}"));
+                show_disconnected(ui, s);
+                schedule_reconnect(ui.clone(), s.clone(), generation);
+                return glib::ControlFlow::Break;
+            }
+            Status::Incompatible(message) => {
+                tracing::error!(machine = %s.name, error = %message, "incompatible server");
+                set_status(ui, s, &message);
+                show_disconnected(ui, s);
+                s.gave_up.set(true);
+                return glib::ControlFlow::Break;
+            }
+            Status::Closed => {
+                show_disconnected(ui, s);
+                schedule_reconnect(ui.clone(), s.clone(), generation);
+                return glib::ControlFlow::Break;
+            }
         }
-        glib::ControlFlow::Continue
-    });
+    }
+    glib::ControlFlow::Continue
 }
 
 /// Show the remote cursor as the video widget's own cursor, so the local

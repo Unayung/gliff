@@ -19,12 +19,20 @@ gtk4.workspace = true
 libadwaita.workspace = true
 gliff-proto.workspace = true
 gliff-transport.workspace = true
-gliff-vk.workspace = true
 gliff-sw.workspace = true
-hypr-capture.workspace = true
-bytes.workspace = true
-drm-fourcc.workspace = true
 hypr-ipc.workspace = true
-hypr-input.workspace = true
+bytes.workspace = true
 serde.workspace = true
 toml = "1"
+
+# The GPU tier (Vulkan + VA-API, dmabufs) and the local keymap follow the
+# Linux compositor; other platforms decode on their own paths.
+[target.'cfg(target_os = "linux")'.dependencies]
+gliff-vk.workspace = true
+hypr-capture.workspace = true
+drm-fourcc.workspace = true
+hypr-input.workspace = true
+
+# VideoToolbox decode and the Metal recombine.
+[target.'cfg(target_os = "macos")'.dependencies]
+gliff-mac.workspace = true

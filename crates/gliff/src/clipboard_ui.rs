@@ -2,6 +2,12 @@
 //! for changes to offer to the server, reads a local item when the server
 //! requests one, and proxies the server's offer as a lazy content provider
 //! whose bytes are fetched only when an application pastes.
+//!
+//! macOS is the exception: the system reads a clipboard owner's data
+//! unprompted (Universal Clipboard), and GDK serves such a read from a
+//! nested main loop that never runs our fetch, which freezes the window.
+//! There the offer's text and image are fetched as soon as it arrives and
+//! put on the clipboard as plain bytes.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -20,8 +26,8 @@ use tokio::sync::mpsc::{Sender, UnboundedSender, WeakUnboundedSender};
 use tokio::sync::oneshot;
 
 use gliff_proto::clipboard::{
-    forwardable_mimes, is_file_mime, local_mimes_for_offer, offers_files, parse_uri_list,
-    resolve_mime, CHUNK,
+    forwardable_mimes, is_file_mime, is_text_mime, local_mimes_for_offer, offers_files,
+    parse_uri_list, resolve_mime, CHUNK, TEXT_MIME,
 };
 use gliff_proto::ClipboardFile;
 use gliff_transport::clipboard::files::{list_files, LocalFiles};
@@ -41,7 +47,8 @@ fn sensitive_selection(mimes: &[String]) -> bool {
 }
 
 fn holds_remote_offer(cb: &gdk::Clipboard) -> bool {
-    cb.content().is_some_and(|p| p.is::<RemoteProvider>())
+    cb.content()
+        .is_some_and(|p| p.is::<RemoteProvider>() || prefetch::holds(&p))
 }
 
 /// Report every change of the local clipboard to the workers, except changes
@@ -219,6 +226,10 @@ pub fn set_remote_offer(
         return;
     };
     let mimes = local_mimes_for_offer(&mime_types, !files.is_empty());
+    if cfg!(target_os = "macos") {
+        prefetch::offer(cb, tx.downgrade(), serial, mimes);
+        return;
+    }
     if mimes.is_empty() {
         if holds_remote_offer(&cb) {
             let _ = cb.set_content(gdk::ContentProvider::NONE);
@@ -228,6 +239,116 @@ pub fn set_remote_offer(
     let provider = RemoteProvider::new(tx.downgrade(), serial, mimes);
     if let Err(e) = cb.set_content(Some(&provider)) {
         tracing::warn!(error = %e, "clipboard proxy not set");
+    }
+}
+
+/// Fetch one item of the server's offer whole, refusing one over `max`
+/// bytes.
+async fn fetch(
+    tx: &WeakUnboundedSender<ToWorker>,
+    serial: u32,
+    mime_type: &str,
+    max: usize,
+) -> Result<Vec<u8>, String> {
+    let tx = tx.upgrade().ok_or("not connected")?;
+    let (sink, mut rx) = tokio::sync::mpsc::channel::<Bytes>(2);
+    let (result_tx, result_rx) = oneshot::channel();
+    tx.send(ToWorker::Fetch {
+        mime_type: mime_type.to_string(),
+        serial,
+        sink,
+        result: result_tx,
+    })
+    .map_err(|_| "worker gone")?;
+    let mut body = Vec::new();
+    while let Some(chunk) = rx.recv().await {
+        if body.len() + chunk.len() > max {
+            // Dropping the receiver cancels the transfer.
+            return Err(format!("larger than {max} bytes"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    match result_rx.await {
+        Ok(Ok(())) => Ok(body),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err("transfer dropped".into()),
+    }
+}
+
+/// The macOS clipboard proxy: the offer's text and first image, fetched up
+/// front (see the module docs). Files are not offered there.
+mod prefetch {
+    use super::*;
+
+    /// Largest item fetched; a bigger one is left off the clipboard.
+    const MAX: usize = 64 * 1024 * 1024;
+    /// Image types GDK's macOS clipboard can hand to other applications.
+    const IMAGE_MIMES: &[&str] = &["image/png", "image/tiff", "image/jpeg"];
+
+    thread_local! {
+        /// The provider put up for the server's offer, so its change signal
+        /// is not echoed back as a local copy.
+        static CURRENT: RefCell<Option<gdk::ContentProvider>> = const { RefCell::new(None) };
+        /// Bumped per offer, so a slow fetch for an older one is dropped.
+        static GENERATION: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub fn holds(p: &gdk::ContentProvider) -> bool {
+        CURRENT.with_borrow(|c| c.as_ref() == Some(p))
+    }
+
+    /// The items worth fetching: one text flavour and one image.
+    fn wanted(mimes: &[String]) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if mimes.iter().any(|m| is_text_mime(m)) {
+            out.push(TEXT_MIME);
+        }
+        if let Some(image) = IMAGE_MIMES.iter().find(|i| mimes.iter().any(|m| m == *i)) {
+            out.push(*image);
+        }
+        out
+    }
+
+    pub fn offer(
+        cb: gdk::Clipboard,
+        tx: WeakUnboundedSender<ToWorker>,
+        serial: u32,
+        mimes: Vec<String>,
+    ) {
+        let generation = GENERATION.get() + 1;
+        GENERATION.set(generation);
+        let wanted = wanted(&mimes);
+        if wanted.is_empty() {
+            if holds_remote_offer(&cb) {
+                CURRENT.take();
+                let _ = cb.set_content(gdk::ContentProvider::NONE);
+            }
+            return;
+        }
+        glib::MainContext::default().spawn_local(async move {
+            let mut parts = Vec::new();
+            for mime in wanted {
+                match fetch(&tx, serial, mime, MAX).await {
+                    Ok(body) => parts.push(gdk::ContentProvider::for_bytes(
+                        mime,
+                        &glib::Bytes::from_owned(body),
+                    )),
+                    Err(e) => tracing::warn!(mime, error = %e, "clipboard item not fetched"),
+                }
+                if GENERATION.get() != generation {
+                    return;
+                }
+            }
+            let provider = match parts.len() {
+                0 => return,
+                1 => parts.remove(0),
+                _ => gdk::ContentProvider::new_union(&parts),
+            };
+            CURRENT.set(Some(provider.clone()));
+            if let Err(e) = cb.set_content(Some(&provider)) {
+                tracing::warn!(error = %e, "clipboard proxy not set");
+            }
+        });
     }
 }
 

@@ -14,6 +14,15 @@ pub type Keymap = watch::Receiver<String>;
 /// server fall back to its default.
 pub const FIRST_KEYMAP_WAIT: Duration = Duration::from_secs(1);
 
+/// Off Linux there is no xkb keymap to follow: the sender is dropped at
+/// once, so a session sends none without waiting and the server uses its
+/// default (us). Keys arrive as evdev codes either way, see `keycode`.
+#[cfg(not(target_os = "linux"))]
+pub fn watch() -> Keymap {
+    watch::channel(String::new()).1
+}
+
+#[cfg(target_os = "linux")]
 pub fn watch() -> Keymap {
     let (tx, rx) = watch::channel(String::new());
     let sink = Box::new(move |text: String| {

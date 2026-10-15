@@ -20,11 +20,11 @@ use gliff_sw::VideoMode;
 use gliff_transport::clipboard::progress::Progress;
 use gliff_transport::clipboard::{outbound_channel, Side, Transfers};
 use gliff_transport::{spawn_ssh, Framed, SshTarget};
-use gliff_vk::{Decoder, DisplayFrame, Gpu};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{self, unbounded_channel, UnboundedReceiver};
 
 use crate::clipboard::{Bridge, ToWorker};
+use crate::gpu::{self, Decoder, DisplayFrame, Gpu};
 use crate::keymap::{Keymap, FIRST_KEYMAP_WAIT};
 
 /// Stream geometry one picture was configured under: stream size, view
@@ -115,10 +115,10 @@ pub enum Endpoint {
     Ssh(SshTarget),
 }
 
-/// A decoded frame for the GTK thread: a dmabuf from the GPU tier, or plain
-/// BGRA pixels from the CPU tier.
+/// A decoded frame for the GTK thread: a GPU-tier frame (a dmabuf on
+/// Linux), or plain BGRA pixels from the CPU tier.
 pub enum Frame {
-    Dmabuf(DisplayFrame),
+    Gpu(DisplayFrame),
     Bgra(gliff_sw::PooledFrame),
 }
 
@@ -191,6 +191,9 @@ impl Worker {
     }
 }
 
+/// Whether the CPU tier asks for Dual420 (4:4:4) ahead of Single420.
+const CPU_FULL_CHROMA: bool = !cfg!(target_os = "linux");
+
 /// The decode pipeline: VA-API and Vulkan compute on the GPU, or OpenH264 on
 /// the CPU.
 enum VideoDecoder {
@@ -206,7 +209,7 @@ fn open_gpu(mode: VideoMode) -> Option<Arc<Gpu>> {
         tracing::info!("using the CPU video pipeline as requested");
         return None;
     }
-    match Gpu::open(Some(&hypr_capture::render_node(None))) {
+    match gpu::open() {
         Ok(gpu) if gpu.can_decode() => Some(gpu),
         Ok(gpu) => {
             tracing::warn!(gpu = %gpu.name, "no VA-API H.264 decoder; falling back to the CPU pipeline");
@@ -279,8 +282,10 @@ where
         max_width: MAX_STREAM.0,
         max_height: MAX_STREAM.1,
         // The CPU tier asks for one 4:2:0 stream so it decodes one stream,
-        // not two; the recombine also costs CPU on this side.
-        chroma: if gpu.is_some() {
+        // not two; the recombine also costs CPU on this side. Off Linux the
+        // CPU tier still asks for full chroma: Apple Silicon decodes both
+        // streams with room to spare, and text stays sharp.
+        chroma: if gpu.is_some() || CPU_FULL_CHROMA {
             vec![ChromaMode::Dual420, ChromaMode::Single420]
         } else {
             vec![ChromaMode::Single420]
@@ -367,7 +372,7 @@ where
         (VideoDecoder::Gpu(_), Some(g)) => g.name.as_str(),
         _ => "cpu",
     };
-    tracing::info!(width, height, scale_milli, decode_on, video = %video_label, "connected");
+    tracing::info!(width, height, scale_milli, ?chroma, decode_on, video = %video_label, "connected");
     let mut logged_first = false;
 
     // Writes run on their own task, fed by `out_tx`, so reads (draining video)
@@ -486,7 +491,7 @@ where
                     VideoDecoder::Gpu(d) => match d.set_zoom(zoom).and_then(|_| d.redraw()) {
                         Ok(frame) => {
                             tracing::info!(zoom = d.zoom(), "decoder output zoom");
-                            frame.map(Frame::Dmabuf)
+                            frame.map(Frame::Gpu)
                         }
                         Err(e) => {
                             tracing::warn!(error = %e, "could not change the output zoom");
@@ -592,7 +597,7 @@ where
                             }
                         }
                         d.decode(&main, &aux)
-                            .map(|f| f.map(Frame::Dmabuf))
+                            .map(|f| f.map(Frame::Gpu))
                             .map_err(anyhow::Error::from)
                     }
                     VideoDecoder::Cpu(d) => d
@@ -626,7 +631,7 @@ where
                             in_decoder
                                 .pop_front()
                                 .unwrap_or(((width, height), view, scale_milli));
-                        if matches!(frame, Frame::Dmabuf(_)) {
+                        if matches!(frame, Frame::Gpu(_)) {
                             last_gpu_geometry = Some((stream, pic_view, pic_scale));
                         }
                         let picture = Picture {
@@ -739,14 +744,18 @@ where
         }
         if last_report.elapsed().as_secs_f32() >= 1.0 {
             let secs = last_report.elapsed().as_secs_f32();
+            let fps = frames_since as f32 / secs;
+            let mbit = bytes_since as f32 * 8.0 / 1_000_000.0 / secs;
+            let decode_ms = if frames_since > 0 {
+                decode_ms_acc / frames_since as f32
+            } else {
+                0.0
+            };
+            tracing::debug!(fps, mbit, decode_ms, width, height, ?chroma, "stats");
             let _ = status.send(Status::Stats {
-                fps: frames_since as f32 / secs,
-                mbit: bytes_since as f32 * 8.0 / 1_000_000.0 / secs,
-                decode_ms: if frames_since > 0 {
-                    decode_ms_acc / frames_since as f32
-                } else {
-                    0.0
-                },
+                fps,
+                mbit,
+                decode_ms,
                 video: video_label.clone(),
             });
             frames_since = 0;

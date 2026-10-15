@@ -2,11 +2,14 @@
 //! decodes the video, shows it, and forwards keyboard and pointer input.
 //!
 //! Decode runs on a worker thread (see `net`); this file is the UI. Decoded
-//! frames arrive as dmabufs, which GTK imports as textures, so the UI has no
-//! GPU code of its own; its one `unsafe` block hands GTK a dmabuf fd.
+//! frames arrive as dmabufs on Linux, which GTK imports as textures, so the
+//! UI has no GPU code of its own; its one `unsafe` block hands GTK a dmabuf
+//! fd. On macOS and in the CPU tier they arrive as pixels in memory.
 
 mod clipboard;
 mod clipboard_ui;
+mod gpu;
+mod keycode;
 mod keymap;
 mod net;
 mod paintable;
@@ -15,7 +18,6 @@ mod theme;
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
-use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc::{channel, sync_channel, Receiver};
@@ -25,7 +27,6 @@ use adw::prelude::*;
 use clap::Parser;
 use gliff_proto::{Axis, ClientMsg};
 use gliff_transport::SshTarget;
-use gliff_vk::DisplayFrame;
 use gtk::gdk;
 use gtk::glib;
 use gtk4 as gtk;
@@ -280,9 +281,7 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
 
     let header = adw::HeaderBar::builder()
         .show_title(false)
-        // No window buttons: closing is the compositor's job, and a stray
-        // click on an X in the middle of a remote session is a bad surprise.
-        .decoration_layout("")
+        .decoration_layout(DECORATION_LAYOUT)
         .build();
     let entry = gtk::Entry::builder()
         .placeholder_text("user@host")
@@ -505,6 +504,16 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         None => {}
     }
 }
+
+/// No window buttons on Hyprland: closing is the compositor's job, and a
+/// stray click on an X in the middle of a remote session is a bad surprise.
+/// macOS has no tiling compositor to do it, so the window gets the usual
+/// buttons where a Mac puts them.
+const DECORATION_LAYOUT: &str = if cfg!(target_os = "macos") {
+    "close,minimize,maximize:"
+} else {
+    ""
+};
 
 const CONNECT_ICON: &str = "go-next-symbolic";
 const STOP_ICON: &str = "media-playback-stop-symbolic";
@@ -1089,7 +1098,7 @@ fn poll_frames(ui: Rc<App>, s: Rc<Session>, rx: Receiver<Picture>, generation: u
 /// a plain memory texture for the CPU tier.
 fn frame_texture(f: Frame) -> Result<gdk::Texture, glib::Error> {
     match f {
-        Frame::Dmabuf(f) => dmabuf_texture(f),
+        Frame::Gpu(f) => gpu_texture(f),
         Frame::Bgra(f) => {
             let bytes = glib::Bytes::from_owned(f.pixels);
             Ok(gdk::MemoryTexture::new(
@@ -1104,10 +1113,31 @@ fn frame_texture(f: Frame) -> Result<gdk::Texture, glib::Error> {
     }
 }
 
+/// Wrap a decoded frame's shared-memory BGRX pixels as a GDK texture. The
+/// frame lives until GTK releases the bytes, which returns its buffer to
+/// the decoder.
+#[cfg(target_os = "macos")]
+fn gpu_texture(f: gpu::DisplayFrame) -> Result<gdk::Texture, glib::Error> {
+    let (width, height, stride) = (f.width as i32, f.height as i32, f.stride);
+    let bytes = glib::Bytes::from_owned(f);
+    Ok(
+        gdk::MemoryTexture::new(width, height, gdk::MemoryFormat::B8g8r8x8, &bytes, stride)
+            .upcast(),
+    )
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn gpu_texture(f: gpu::DisplayFrame) -> Result<gdk::Texture, glib::Error> {
+    match f {}
+}
+
 /// Wrap a decoded frame's dmabuf as a GDK texture. The frame (and its fd)
 /// lives until GTK releases the texture, which returns the image to the
 /// decoder's ring.
-fn dmabuf_texture(f: DisplayFrame) -> Result<gdk::Texture, glib::Error> {
+#[cfg(target_os = "linux")]
+fn gpu_texture(f: gpu::DisplayFrame) -> Result<gdk::Texture, glib::Error> {
+    use std::os::fd::AsRawFd;
+
     let display = gdk::Display::default()
         .ok_or_else(|| glib::Error::new(glib::FileError::Failed, "no display"))?;
     let builder = gdk::DmabufTextureBuilder::new()
@@ -1558,6 +1588,23 @@ fn track_key(ui: &App, code: u32, pressed: bool) -> bool {
     }
 }
 
+/// macOS reports Caps Lock once per toggle, a press when it turns on and a
+/// release when it turns off, so each event is a whole tap on the remote.
+const TOGGLED_CAPS_LOCK: bool = cfg!(target_os = "macos");
+
+/// Press and release a key on the remote.
+fn tap_key(ui: &App, code: u32) {
+    for pressed in [true, false] {
+        send(
+            ui,
+            ClientMsg::Key {
+                keycode: code,
+                pressed,
+            },
+        );
+    }
+}
+
 fn install_input_handlers(
     ui: &Rc<App>,
     video: &gtk::Widget,
@@ -1567,9 +1614,10 @@ fn install_input_handlers(
     video.set_focusable(true);
     video.set_can_focus(true);
 
-    // Keyboard: hardware keycode minus 8 is the evdev code. The controller
-    // runs in the capture phase so that while the picture has the keyboard
-    // every key goes to the remote, ahead of any local handling.
+    // Keyboard: the hardware keycode maps to an evdev code (see `keycode`).
+    // The controller runs in the capture phase so that while the picture
+    // has the keyboard every key goes to the remote, ahead of any local
+    // handling.
     let key = gtk::EventControllerKey::new();
     key.set_propagation_phase(gtk::PropagationPhase::Capture);
     let last_tap: Rc<RefCell<Option<Instant>>> = Rc::new(RefCell::new(None));
@@ -1584,9 +1632,14 @@ fn install_input_handlers(
                 release_capture(&ui, &window);
                 return glib::Propagation::Stop;
             }
-            let code = keycode.saturating_sub(8);
-            tracing::debug!(code, "key pressed");
-            if track_key(&ui, code, true) {
+            let Some(code) = keycode::evdev(keycode) else {
+                tracing::debug!(keycode, "unmapped key pressed");
+                return glib::Propagation::Stop;
+            };
+            tracing::debug!(keycode, code, "key pressed");
+            if TOGGLED_CAPS_LOCK && code == keycode::CAPS_LOCK {
+                tap_key(&ui, code);
+            } else if track_key(&ui, code, true) {
                 send(
                     &ui,
                     ClientMsg::Key {
@@ -1601,9 +1654,13 @@ fn install_input_handlers(
     {
         let ui = ui.clone();
         key.connect_key_released(move |_, _keyval, keycode, _state| {
-            let code = keycode.saturating_sub(8);
-            tracing::debug!(code, "key released");
-            if track_key(&ui, code, false) {
+            let Some(code) = keycode::evdev(keycode) else {
+                return;
+            };
+            tracing::debug!(keycode, code, "key released");
+            if TOGGLED_CAPS_LOCK && code == keycode::CAPS_LOCK {
+                tap_key(&ui, code);
+            } else if track_key(&ui, code, false) {
                 send(
                     &ui,
                     ClientMsg::Key {
@@ -1686,31 +1743,17 @@ fn install_input_handlers(
     video.add_controller(click);
 
     // Scroll.
+    // A wheel scrolls in notches; a touchpad scrolls smoothly in surface
+    // pixels, which go on as such so each small movement is not a notch.
     let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
     {
         let ui = ui.clone();
-        scroll.connect_scroll(move |_, dx, dy| {
-            if dy != 0.0 {
-                send(
-                    &ui,
-                    ClientMsg::PointerAxis {
-                        axis: Axis::Vertical,
-                        value: dy * 15.0,
-                        discrete: Some(dy.signum() as i32),
-                        stop: false,
-                    },
-                );
-            }
-            if dx != 0.0 {
-                send(
-                    &ui,
-                    ClientMsg::PointerAxis {
-                        axis: Axis::Horizontal,
-                        value: dx * 15.0,
-                        discrete: Some(dx.signum() as i32),
-                        stop: false,
-                    },
-                );
+        scroll.connect_scroll(move |c, dx, dy| {
+            let wheel = c.unit() == gdk::ScrollUnit::Wheel;
+            for (axis, delta) in [(Axis::Vertical, dy), (Axis::Horizontal, dx)] {
+                if delta != 0.0 {
+                    send(&ui, scroll_msg(axis, delta, wheel));
+                }
             }
             glib::Propagation::Stop
         });
@@ -1942,6 +1985,18 @@ fn request_resize(ui: &App) {
             scale: scale as f32,
         },
     );
+}
+
+/// The axis event for one scroll delta: a wheel delta counts notches, which
+/// the remote sees as discrete steps of 15 pixels; a smooth delta is already
+/// in pixels.
+fn scroll_msg(axis: Axis, delta: f64, wheel: bool) -> ClientMsg {
+    ClientMsg::PointerAxis {
+        axis,
+        value: if wheel { delta * 15.0 } else { delta },
+        discrete: wheel.then(|| delta.signum() as i32),
+        stop: false,
+    }
 }
 
 /// GTK button number to evdev `BTN_*`.

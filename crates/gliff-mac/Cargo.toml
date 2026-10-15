@@ -1,0 +1,24 @@
+[package]
+name = "gliff-mac"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-metal = "0.3"
+objc2-core-foundation = "0.3"
+objc2-core-video = "0.3"
+objc2-core-media = "0.3"
+objc2-video-toolbox = "0.3"
+thiserror.workspace = true
+tracing.workspace = true
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+gliff-proto.workspace = true
+gliff-sw.workspace = true

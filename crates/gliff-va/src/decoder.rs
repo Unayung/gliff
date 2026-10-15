@@ -258,16 +258,8 @@ impl H264Decoder {
         let refs = (sps.max_num_ref_frames as usize).clamp(1, 16);
         let dpb_slots = refs + 1;
         self.stream = None;
-        // NVIDIA's VA-API driver lays out a block-linear surface whose
-        // width is not a multiple of 256 differently from how Vulkan imports
-        // it, and the chroma plane reads back as zeros (a green picture).
-        // A wider surface keeps the layouts in agreement; the decoder writes
-        // only the coded picture and the consumers read only the stream size.
-        let surface_w = cw
-            .next_multiple_of(SURFACE_WIDTH_ALIGN)
-            .min(self.max_width.max(cw));
         let surfaces = (0..dpb_slots + 1)
-            .map(|_| Surface::new_nv12(&self.display, surface_w, ch, UsageHint::Decoder))
+            .map(|_| Surface::new_nv12(&self.display, cw, ch, UsageHint::Decoder))
             .collect::<Result<Vec<_>>>()?;
         let targets: Vec<&Surface> = surfaces.iter().collect();
         let context = Context::new(&self.display, &self.config, cw, ch, &targets)?;
@@ -289,9 +281,6 @@ impl H264Decoder {
         Ok(())
     }
 }
-
-/// The width alignment of decode surfaces (see `open_stream`).
-const SURFACE_WIDTH_ALIGN: u32 = 256;
 
 fn va_picture(surface: &Surface, p: DpbPicture, flags: u32) -> va::VAPictureH264 {
     va::VAPictureH264 {

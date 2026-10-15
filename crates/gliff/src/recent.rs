@@ -17,6 +17,9 @@ pub struct Config {
     /// The machine the window showed last.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shown: Option<String>,
+    /// The highest scale a headless output renders at; see --max-scale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_scale: Option<f64>,
 }
 
 impl Config {

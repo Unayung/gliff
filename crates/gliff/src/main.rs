@@ -87,6 +87,21 @@ struct Cli {
     /// the GLIFF_VIDEO environment variable.
     #[arg(long, value_parser = ["gpu", "cpu"])]
     video: Option<String>,
+    /// With --headless: render the remote at most at this scale, e.g. `1`
+    /// on a 2x display, and show it enlarged by whole pixels. The layout
+    /// stays the same size; a quarter of the pixels go over the link, so
+    /// motion keeps its frame rate on a slow one, at the cost of 1x text.
+    /// The header's 1x button sets the same for every run; this flag
+    /// overrides it for this one.
+    #[arg(long, requires = "headless", value_parser = parse_max_scale)]
+    max_scale: Option<f64>,
+}
+
+fn parse_max_scale(s: &str) -> Result<f64, String> {
+    match s.parse::<f64>() {
+        Ok(v) if (1.0..=4.0).contains(&v) => Ok(v),
+        _ => Err("expected a scale from 1 to 4".into()),
+    }
 }
 
 /// Everything the UI shares with its callbacks.
@@ -124,6 +139,11 @@ struct App {
     /// Size of the video widget in device pixels, rounded down to even.
     view_size: Cell<(u32, u32)>,
     view_scale: Cell<f64>,
+    /// The cap on the remote's render scale: --max-scale, else the header's
+    /// 1x button, kept in the config.
+    max_scale: Cell<Option<f64>>,
+    /// The 1x button; shown only on a display above 1x.
+    low_res_btn: gtk::ToggleButton,
     /// Evdev codes currently held on the remote, so they can all be released
     /// when the keyboard is handed back to the local compositor.
     pressed_keys: RefCell<BTreeSet<u32>>,
@@ -319,6 +339,14 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         .icon_name("utilities-system-monitor-symbolic")
         .tooltip_text("Show stats")
         .build();
+    let low_res_btn = gtk::ToggleButton::builder()
+        .label("1×")
+        .tooltip_text(
+            "Render the remote at 1x: a quarter of the pixels, so motion stays \
+             smooth on a slow link, with less sharp text",
+        )
+        .visible(false)
+        .build();
     let tabs = gtk::Box::builder().spacing(6).build();
     let tabs_scroller = gtk::ScrolledWindow::builder()
         .child(&tabs)
@@ -331,6 +359,7 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
     header.pack_start(&add_revealer);
     header.pack_end(&fullscreen_btn);
     header.pack_end(&stats_btn);
+    header.pack_end(&low_res_btn);
 
     let stats = gtk::Label::builder()
         .halign(gtk::Align::Start)
@@ -411,6 +440,11 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         active: RefCell::new(None),
         view_size: Cell::new((0, 0)),
         view_scale: Cell::new(1.0),
+        max_scale: Cell::new(
+            cli.max_scale
+                .or_else(|| Config::load(&Config::default_path()).max_scale),
+        ),
+        low_res_btn: low_res_btn.clone(),
         pressed_keys: RefCell::new(BTreeSet::new()),
         released: Cell::new(false),
         config_path: Config::default_path(),
@@ -424,6 +458,7 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
     });
     install_input_handlers(&ui, &video, &window, hotkey);
     install_resize_handler(&ui);
+    install_low_res_button(&ui);
     install_address_bar(&ui, &connect_btn);
     refresh_tabs(&ui);
 
@@ -1940,9 +1975,11 @@ fn install_resize_handler(ui: &Rc<App>) {
     // timer sends only once the size has held for 200 ms.
     let ui = ui.clone();
     glib::timeout_add_local(Duration::from_millis(100), move || {
-        let scale = device_scale(&ui);
-        ui.frame.set_scale(scale);
+        let device = device_scale(&ui);
+        ui.frame.set_scale(device);
+        ui.low_res_btn.set_visible(device > 1.0);
         request_zoom(&ui);
+        let scale = remote_scale(&ui);
         let (w, h) = (
             ui.video.width() as f64 * scale,
             ui.video.height() as f64 * scale,
@@ -1998,7 +2035,7 @@ fn request_resize(ui: &App) {
         return;
     };
     let size = ui.view_size.get();
-    let scale = device_scale(ui);
+    let scale = remote_scale(ui);
     if size.0 < 64
         || size.1 < 64
         || (s.resize_scale.get() == scale
@@ -2046,6 +2083,31 @@ fn device_scale(ui: &App) -> f64 {
     ui.window
         .surface()
         .map_or(ui.video.scale_factor() as f64, |s| s.scale())
+}
+
+/// The scale the remote renders at: the display's, capped by --max-scale.
+/// A view below the display's resolution is shown zoomed by the decoder.
+fn remote_scale(ui: &App) -> f64 {
+    let device = device_scale(ui);
+    ui.max_scale.get().map_or(device, |max| device.min(max))
+}
+
+/// The 1x button caps the remote's scale at 1, or lifts the cap, and keeps
+/// the choice in the config; the resize poll sends the new scale.
+fn install_low_res_button(ui: &Rc<App>) {
+    ui.low_res_btn
+        .set_active(ui.max_scale.get().is_some_and(|max| max <= 1.0));
+    let weak = Rc::downgrade(ui);
+    ui.low_res_btn.connect_toggled(move |btn| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        let max_scale = btn.is_active().then_some(1.0);
+        ui.max_scale.set(max_scale);
+        let mut config = Config::load(&ui.config_path);
+        config.max_scale = max_scale;
+        save_config(&ui, &config);
+    });
 }
 
 #[cfg(test)]

@@ -3,11 +3,11 @@
 //!
 //! The server sends Annex B access units with the SPS and PPS in front of
 //! every IDR. VideoToolbox wants the parameter sets in a format description
-//! and the slices length-prefixed (AVCC), so each unit is rewritten. Decode
-//! runs synchronously: neither the asynchronous nor the temporal-processing
-//! flag is set, so the output callback has run when `decode_frame` returns,
-//! and frames come out in decode order, one per unit, with no reordering
-//! delay (our streams have no B frames).
+//! and the slices length-prefixed (AVCC), so each unit is rewritten. A unit
+//! is submitted for asynchronous decode and collected with `finish`, so the
+//! main and aux streams decode at the same time. The temporal-processing
+//! flag stays clear, so frames come out in decode order, one per unit, with
+//! no reordering delay (our streams have no B frames).
 
 use std::ffi::c_void;
 use std::ptr::{self, NonNull};
@@ -105,6 +105,9 @@ pub(crate) struct Stream {
     sps: Vec<u8>,
     pps: Vec<u8>,
     slot: Box<Mutex<Slot>>,
+    /// The unit being decoded: the sample, and the AVCC bytes it borrows,
+    /// which the decoder may read until `finish`.
+    pending: Option<(CFRetained<CMSampleBuffer>, Vec<u8>)>,
 }
 
 impl Stream {
@@ -115,12 +118,15 @@ impl Stream {
             sps: Vec::new(),
             pps: Vec::new(),
             slot: Box::default(),
+            pending: None,
         }
     }
 
-    /// Decode one access unit. `None` while no parameter sets have arrived,
-    /// or when the unit carries no slice.
-    pub(crate) fn decode(&mut self, unit: &[u8]) -> Result<Option<CFRetained<CVPixelBuffer>>> {
+    /// Start decoding one access unit; `finish` waits for its picture.
+    /// Nothing is started while no parameter sets have arrived, or for a
+    /// unit with no slice.
+    pub(crate) fn submit(&mut self, unit: &[u8]) -> Result<()> {
+        self.finish()?;
         let mut avcc = Vec::with_capacity(unit.len() + 16);
         for nal in nal_units(unit) {
             match nal[0] & 0x1f {
@@ -134,26 +140,27 @@ impl Stream {
             }
         }
         if !has_slice(&avcc) {
-            return Ok(None);
+            return Ok(());
         }
         if self.session.is_none() {
             if self.sps.is_empty() || self.pps.is_empty() {
-                return Ok(None);
+                return Ok(());
             }
             self.open()?;
         }
         let (Some(session), Some(format)) = (&self.session, &self.format) else {
-            return Ok(None);
+            return Ok(());
         };
         let sample = sample_buffer(&mut avcc, format)?;
         *self.slot.lock().map_err(|_| Error::Poisoned)? = Slot::default();
         let mut info = VTDecodeInfoFlags::empty();
-        // SAFETY: the sample buffer points into `avcc`, which outlives the
-        // call, and synchronous decode finishes before it returns.
+        // SAFETY: the sample buffer points into `avcc`'s heap block, which
+        // `pending` keeps alive (moving the Vec does not move the block)
+        // until `finish` has waited for the decode.
         let status = unsafe {
             session.decode_frame(
                 &sample,
-                VTDecodeFrameFlags::empty(),
+                VTDecodeFrameFlags::Frame_EnableAsynchronousDecompression,
                 ptr::null_mut(),
                 &mut info,
             )
@@ -164,6 +171,26 @@ impl Stream {
             self.close();
             return Err(Error::Vt("decode", status));
         }
+        self.pending = Some((sample, avcc));
+        Ok(())
+    }
+
+    /// Wait for the unit `submit` started and take its picture; `None` when
+    /// nothing was started.
+    pub(crate) fn finish(&mut self) -> Result<Option<CFRetained<CVPixelBuffer>>> {
+        let Some(pending) = self.pending.take() else {
+            return Ok(None);
+        };
+        if let Some(session) = &self.session {
+            // SAFETY: a live session; returns once its output callbacks
+            // for every submitted frame have run.
+            let status = unsafe { session.wait_for_asynchronous_frames() };
+            if status != 0 {
+                self.close();
+                return Err(Error::Vt("wait for decode", status));
+            }
+        }
+        drop(pending);
         let mut slot = self.slot.lock().map_err(|_| Error::Poisoned)?;
         if slot.status != 0 {
             return Err(Error::Vt("decoded frame", slot.status));
@@ -263,9 +290,10 @@ impl Stream {
     fn close(&mut self) {
         if let Some(session) = self.session.take() {
             // SAFETY: tears down the session, so no callback can reach the
-            // slot after this.
+            // slot, and no decode can read a pending unit, after this.
             unsafe { session.invalidate() };
         }
+        self.pending = None;
         self.format = None;
     }
 }

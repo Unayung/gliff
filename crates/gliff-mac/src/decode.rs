@@ -240,9 +240,16 @@ impl Decoder {
     /// Decode one access unit pair and recombine to a display frame. Blocks
     /// until the frame is complete. `None` when the unit had no picture.
     pub fn decode(&mut self, main: &[u8], aux: &[u8]) -> Result<Option<DisplayFrame>> {
-        // Both streams are fed every unit so the pair stays in step.
-        let main_pic = self.main.decode(main);
-        let aux_pic = self.aux.as_mut().map(|s| s.decode(aux)).transpose();
+        // Both streams are fed every unit so the pair stays in step, and
+        // both are in flight before either is waited for, so they decode
+        // at the same time. Each started unit is collected even when the
+        // other stream failed.
+        let main_sent = self.main.submit(main);
+        let aux_sent = self.aux.as_mut().map(|s| s.submit(aux)).transpose();
+        let main_pic = self.main.finish();
+        let aux_pic = self.aux.as_mut().map(Stream::finish).transpose();
+        main_sent?;
+        aux_sent?;
         let (main_pic, aux_pic) = (main_pic?, aux_pic?);
         let pair = match (main_pic, aux_pic) {
             (Some(m), None) if self.aux.is_none() => (m, None),

@@ -123,6 +123,10 @@ enum Cmd {
         #[arg(long)]
         output: Option<String>,
     },
+    /// Decode captured streams (`main.264`, `aux.264` and `index.txt`, one
+    /// "main_len aux_len width height" line per frame, in DIR) and print the
+    /// first pixel and mean colour of each picture. SINGLE=1 ignores aux.
+    DecodeDump { dir: PathBuf },
     /// Connect over TCP or SSH and decode real desktop frames
     ServeTest {
         #[arg(long, default_value = "127.0.0.1:9000", conflicts_with = "ssh")]
@@ -137,8 +141,13 @@ enum Cmd {
     /// Stream from a running `gliff-server --listen` for a while and report
     /// startup milestones, frame rate, interval jitter, latency and bandwidth
     StreamBench {
-        #[arg(long, default_value = "127.0.0.1:9000")]
+        #[arg(long, default_value = "127.0.0.1:9000", conflicts_with = "ssh")]
         connect: String,
+        /// Start the server over SSH on this host instead of connecting.
+        #[arg(long)]
+        ssh: Option<String>,
+        #[arg(long, default_value = "gliff-server")]
+        server_bin: String,
         #[arg(long, default_value_t = 10.0)]
         seconds: f64,
         /// Ask the server for this stream size (0 = leave it alone).
@@ -241,6 +250,41 @@ fn main() -> Result<()> {
             click,
         } => input(&target, output, &text, click)?,
         Cmd::Pipeline { output } => pipeline(&target, &node, capture_mode, output, video)?,
+        Cmd::DecodeDump { dir } => {
+            let gpu = match video {
+                VideoMode::Gpu => Some(Gpu::open(Some(&node))?),
+                VideoMode::Cpu => None,
+            };
+            let main = std::fs::read(dir.join("main.264"))?;
+            let aux = std::fs::read(dir.join("aux.264"))?;
+            let index = std::fs::read_to_string(dir.join("index.txt"))?;
+            let (mut mo, mut ao) = (0, 0);
+            let mut dec = None;
+            for line in index.lines() {
+                let v: Vec<usize> = line.split(' ').map(|s| s.parse().unwrap()).collect();
+                let single = std::env::var_os("SINGLE").is_some();
+                let d = dec.get_or_insert(serve_decoder(&gpu, !single, v[2] as u32, v[3] as u32)?);
+                let a = if single { &[][..] } else { &aux[ao..ao + v[1]] };
+                let px = d.decode_to_bgra(&main[mo..mo + v[0]], a)?;
+                mo += v[0];
+                ao += v[1];
+                if let Some(px) = px {
+                    let n = px.len() / 4;
+                    let mut sum = [0u64; 3];
+                    for p in px.chunks(4) {
+                        for c in 0..3 {
+                            sum[c] += p[c] as u64;
+                        }
+                    }
+                    println!(
+                        "first bgra={:?} mean bgr={:?} len={}",
+                        &px[..4],
+                        sum.map(|s| s / n as u64),
+                        px.len()
+                    );
+                }
+            }
+        }
         Cmd::ServeTest {
             connect,
             frames,
@@ -249,6 +293,8 @@ fn main() -> Result<()> {
         } => serve_test(&node, &connect, frames, video, ssh.as_deref(), &server_bin)?,
         Cmd::StreamBench {
             connect,
+            ssh,
+            server_bin,
             seconds,
             width,
             height,
@@ -258,6 +304,8 @@ fn main() -> Result<()> {
         } => stream_bench(
             &node,
             &connect,
+            ssh.as_deref(),
+            &server_bin,
             seconds,
             (width, height),
             no_decode,
@@ -891,6 +939,8 @@ fn bench_now_ms() -> u64 {
 fn stream_bench(
     node: &std::path::Path,
     addr: &str,
+    ssh: Option<&str>,
+    server_bin: &str,
     seconds: f64,
     size: (u32, u32),
     no_decode: bool,
@@ -911,10 +961,21 @@ fn stream_bench(
         let milestone = |name: &str| {
             println!("MILESTONE {name} {:.0} ms", start.elapsed().as_secs_f64() * 1000.0);
         };
-        let stream = tokio::net::TcpStream::connect(addr).await.with_context(|| format!("connect {addr}"))?;
-        stream.set_nodelay(true)?;
+        let _ssh_child;
+        let (rd, wr): (Box<dyn tokio::io::AsyncRead + Unpin>, Box<dyn tokio::io::AsyncWrite + Unpin>) = if let Some(host) = ssh {
+            let mut target = gliff_transport::SshTarget::new(host);
+            target.server_bin = server_bin.into();
+            let stream = gliff_transport::spawn_ssh(&target)?;
+            _ssh_child = Some(stream.child);
+            (Box::new(stream.stdout), Box::new(stream.stdin))
+        } else {
+            _ssh_child = None;
+            let stream = tokio::net::TcpStream::connect(addr).await.with_context(|| format!("connect {addr}"))?;
+            stream.set_nodelay(true)?;
+            let (rd, wr) = tokio::io::split(stream);
+            (Box::new(rd), Box::new(wr))
+        };
         milestone("connected");
-        let (rd, wr) = tokio::io::split(stream);
         let mut reader = Framed::new(rd);
         let mut writer = Framed::new(wr);
         let caps = ClientCaps { codecs: vec![Codec::H264], max_width: 3840, max_height: 2160, chroma: vec![ChromaMode::Dual420, ChromaMode::Single420], features: gliff_proto::features() };

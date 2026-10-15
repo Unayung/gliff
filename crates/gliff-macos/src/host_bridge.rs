@@ -105,8 +105,19 @@ pub async fn relay(config: &crate::server::Cli) -> Result<()> {
     let app = bundle
         .filter(|p| p.join("Contents/Info.plist").is_file())
         .context("install Gliff.app with bin/install-macos before hosting")?;
-    let status = tokio::process::Command::new("/usr/bin/open")
-        .args(["-n", "-g", "-a"])
+    let mut open = tokio::process::Command::new("/usr/bin/open");
+    open.args(["-n", "-g"]);
+    // LaunchServices drops the SSH session's environment and stderr; this
+    // hands the host app a log file and RUST_LOG for debugging.
+    if let Some(log) = std::env::var_os("GLIFF_HOST_LOG") {
+        let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "gliff_macos=debug".into());
+        open.arg("--stderr")
+            .arg(log)
+            .arg("--env")
+            .arg(format!("RUST_LOG={filter}"));
+    }
+    let status = open
+        .arg("-a")
         .arg(app)
         .args(["--args", "--host-bridge"])
         .arg(&path)

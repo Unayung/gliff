@@ -4,6 +4,7 @@ import CoreMedia
 import CoreVideo
 import ApplicationServices
 import VideoToolbox
+import Metal
 
 // stdout belongs exclusively to the bridge. Diagnostics go to stderr.
 let outputLock = NSLock()
@@ -356,6 +357,342 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
         append(UInt32(width), &data); append(UInt32(height), &data); append(frameScale, &data)
         for row in 0..<height { data.append(base.advanced(by: row * stride).assumingMemoryBound(to: UInt8.self), count: width * 4) }
         packet(1, data)
+    }
+}
+
+// The hardware stream: ScreenCaptureKit hands IOSurface frames at the stream
+// size, a Metal kernel splits each into AVC444's main and auxiliary NV12
+// (the twin of gliff-vk's split.comp, BT.709 limited range), and one
+// VideoToolbox session per plane set encodes them. No frame is copied
+// through the CPU. The bridge grants one encode at a time ("frame"), so the
+// link, not the screen, sets the pace and the frame sent is always the
+// newest one.
+let splitSource = """
+#include <metal_stdlib>
+using namespace metal;
+static float luma(float3 c) { return (16.0 + 0.1826 * c.r + 0.6142 * c.g + 0.0620 * c.b) / 255.0; }
+static float chroma_u(float3 c) { return (128.0 - 0.1006 * c.r - 0.3386 * c.g + 0.4392 * c.b) / 255.0; }
+static float chroma_v(float3 c) { return (128.0 + 0.4392 * c.r - 0.3989 * c.g - 0.0403 * c.b) / 255.0; }
+static float3 px(texture2d<float, access::read> src, int x, int y) {
+    uint2 p = uint2(clamp(x, 0, int(src.get_width()) - 1), clamp(y, 0, int(src.get_height()) - 1));
+    return src.read(p).rgb * 255.0;
+}
+kernel void split(texture2d<float, access::read> src [[texture(0)]],
+                  texture2d<float, access::write> main_y [[texture(1)]],
+                  texture2d<float, access::write> main_uv [[texture(2)]],
+                  texture2d<float, access::write> aux_y [[texture(3)]],
+                  texture2d<float, access::write> aux_uv [[texture(4)]],
+                  constant int &has_aux [[buffer(0)]],
+                  uint2 gid [[thread_position_in_grid]]) {
+    int width = int(main_y.get_width()), height = int(main_y.get_height());
+    int bx = int(gid.x), by = int(gid.y), x = 2 * bx, y = 2 * by;
+    if (x >= width || y >= height) return;
+    float3 c00 = px(src, x, y), c10 = px(src, x + 1, y), c01 = px(src, x, y + 1), c11 = px(src, x + 1, y + 1);
+    main_y.write(float4(luma(c00)), uint2(x, y));
+    main_y.write(float4(luma(c10)), uint2(x + 1, y));
+    main_y.write(float4(luma(c01)), uint2(x, y + 1));
+    main_y.write(float4(luma(c11)), uint2(x + 1, y + 1));
+    main_uv.write(float4(chroma_u(c00), chroma_v(c00), 0.0, 0.0), uint2(bx, by));
+    if (has_aux == 0) return;
+    aux_uv.write(float4(chroma_u(c10), chroma_v(c10), 0.0, 0.0), uint2(bx, by));
+    int half_h = height / 2;
+    aux_y.write(float4(chroma_u(c01)), uint2(x, by));
+    aux_y.write(float4(chroma_u(c11)), uint2(x + 1, by));
+    aux_y.write(float4(chroma_v(c01)), uint2(x, half_h + by));
+    aux_y.write(float4(chroma_v(c11)), uint2(x + 1, half_h + by));
+}
+"""
+
+func annexB(_ sample: CMSampleBuffer) -> (Data, Bool)? {
+    guard sample.isValid, let format = sample.formatDescription, let buffer = sample.dataBuffer else { return nil }
+    let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [[CFString: Any]]
+    let keyframe = (attachments?.first?[kCMSampleAttachmentKey_NotSync] as? Bool) != true
+    var encoded = Data()
+    var pointer: UnsafePointer<UInt8>?, size = 0, count = 0, headerLength: Int32 = 0
+    guard CMVideoFormatDescriptionGetH264ParameterSetAtIndex(format, parameterSetIndex: 0, parameterSetPointerOut: &pointer, parameterSetSizeOut: &size, parameterSetCountOut: &count, nalUnitHeaderLengthOut: &headerLength) == noErr,
+          headerLength >= 1, headerLength <= 4 else { return nil }
+    if keyframe {
+        for i in 0..<count {
+            guard CMVideoFormatDescriptionGetH264ParameterSetAtIndex(format, parameterSetIndex: i, parameterSetPointerOut: &pointer, parameterSetSizeOut: &size, parameterSetCountOut: nil, nalUnitHeaderLengthOut: nil) == noErr,
+                  let pointer = pointer, size > 0 else { return nil }
+            encoded.append(contentsOf: [0, 0, 0, 1]); encoded.append(pointer, count: size)
+        }
+    }
+    let length = CMBlockBufferGetDataLength(buffer)
+    var avcc = Data(count: length)
+    let copied = avcc.withUnsafeMutableBytes { raw in CMBlockBufferCopyDataBytes(buffer, atOffset: 0, dataLength: length, destination: raw.baseAddress!) }
+    guard copied == noErr else { return nil }
+    var offset = 0
+    while offset < avcc.count {
+        guard offset + Int(headerLength) <= avcc.count else { return nil }
+        var size = 0
+        for byte in avcc[offset..<offset + Int(headerLength)] { size = (size << 8) | Int(byte) }
+        offset += Int(headerLength)
+        guard size > 0, size <= avcc.count - offset else { return nil }
+        encoded.append(contentsOf: [0, 0, 0, 1]); encoded.append(avcc[offset..<offset + size]); offset += size
+    }
+    return (encoded, keyframe)
+}
+
+// One VideoToolbox H.264 session: High profile, no reordering, keyframes
+// only on request, rate changed in place.
+final class VTStream {
+    var session: VTCompressionSession?
+    let width: Int, height: Int
+    var output: Data?
+    var keyframe = false
+    init(_ width: Int, _ height: Int, _ bitrate: Int, _ fps: Int, _ vbvMs: Int) throws {
+        self.width = width; self.height = height
+        let attributes = [kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                          kCVPixelBufferWidthKey: width, kCVPixelBufferHeightKey: height,
+                          kCVPixelBufferMetalCompatibilityKey: true,
+                          kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary
+        let callback: VTCompressionOutputCallback = { refcon, _, status, flags, sample in
+            guard let refcon = refcon else { return }
+            let stream = Unmanaged<VTStream>.fromOpaque(refcon).takeUnretainedValue()
+            autoreleasepool {
+                if status == noErr, !flags.contains(.frameDropped), let sample = sample, let (data, key) = annexB(sample) {
+                    stream.output = data; stream.keyframe = key
+                }
+            }
+        }
+        // Low-latency rate control keeps each frame near its budget instead
+        // of averaging over a window; fall back where it is not offered.
+        var created = noErr
+        for lowLatency in [true, false] {
+            var spec: [CFString: Any] = [kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: true]
+            if lowLatency { spec[kVTVideoEncoderSpecification_EnableLowLatencyRateControl] = true }
+            created = VTCompressionSessionCreate(allocator: kCFAllocatorDefault, width: Int32(width), height: Int32(height), codecType: kCMVideoCodecType_H264,
+                encoderSpecification: spec as CFDictionary, imageBufferAttributes: attributes, compressedDataAllocator: nil,
+                outputCallback: callback, refcon: Unmanaged.passUnretained(self).toOpaque(), compressionSessionOut: &session)
+            if created == noErr { break }
+        }
+        guard created == noErr, let session = session else { throw NSError(domain: "Gliff.Encoder", code: Int(created), userInfo: [NSLocalizedDescriptionKey: "create hardware encoder failed (\(created))"]) }
+        let required: [(CFString, CFTypeRef)] = [
+            (kVTCompressionPropertyKey_RealTime, kCFBooleanTrue),
+            (kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse),
+            (kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_High_AutoLevel),
+        ]
+        for (key, value) in required {
+            let status = VTSessionSetProperty(session, key: key, value: value)
+            if status != noErr { close(); throw NSError(domain: "Gliff.Encoder", code: Int(status), userInfo: [NSLocalizedDescriptionKey: "set \(key) failed (\(status))"]) }
+        }
+        let optional: [(CFString, CFTypeRef)] = [
+            (kVTCompressionPropertyKey_MaxKeyFrameInterval, Int32.max as CFNumber),
+            (kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, 86400 as CFNumber),
+            (kVTCompressionPropertyKey_ColorPrimaries, kCVImageBufferColorPrimaries_ITU_R_709_2),
+            (kVTCompressionPropertyKey_TransferFunction, kCVImageBufferTransferFunction_ITU_R_709_2),
+            (kVTCompressionPropertyKey_YCbCrMatrix, kCVImageBufferYCbCrMatrix_ITU_R_709_2),
+            (kVTCompressionPropertyKey_MaximizePowerEfficiency, kCFBooleanFalse),
+            // One short-term reference, as the Linux encoder codes it: the
+            // clients' VA-API parser takes no long-term reference marking.
+            (kVTCompressionPropertyKey_EnableLTR, kCFBooleanFalse),
+            (kVTCompressionPropertyKey_ReferenceBufferCount, 1 as CFNumber),
+        ]
+        for (key, value) in optional { _ = VTSessionSetProperty(session, key: key, value: value) }
+        setRate(bitrate, fps, vbvMs)
+        let prepared = VTCompressionSessionPrepareToEncodeFrames(session)
+        if prepared != noErr { close(); throw NSError(domain: "Gliff.Encoder", code: Int(prepared), userInfo: [NSLocalizedDescriptionKey: "prepare hardware encoder failed (\(prepared))"]) }
+        // The specification requires hardware, so creation fails without it.
+        // (Low-latency sessions do not report UsingHardwareAcceleratedVideoEncoder.)
+    }
+    func setRate(_ bitrate: Int, _ fps: Int, _ vbvMs: Int) {
+        guard let session = session else { return }
+        _ = VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: max(bitrate, 10_000) as CFNumber)
+        _ = VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: max(fps, 1) as CFNumber)
+        let window = Double(max(vbvMs, 50)) / 1000
+        let limits = [Double(bitrate) / 8 * window, window] as CFArray
+        _ = VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits, value: limits)
+    }
+    var pool: CVPixelBufferPool? { session.flatMap { VTCompressionSessionGetPixelBufferPool($0) } }
+    func submit(_ pixel: CVPixelBuffer, _ pts: CMTime, _ keyframe: Bool) -> OSStatus {
+        guard let session = session else { return -1 }
+        output = nil
+        let properties = [kVTEncodeFrameOptionKey_ForceKeyFrame: keyframe] as CFDictionary
+        return VTCompressionSessionEncodeFrame(session, imageBuffer: pixel, presentationTimeStamp: pts, duration: .invalid, frameProperties: properties, sourceFrameRefcon: nil, infoFlagsOut: nil)
+    }
+    func complete() { if let session = session { VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid) } }
+    func close() { if let session = session { VTCompressionSessionInvalidate(session); self.session = nil } }
+    deinit { close() }
+}
+
+final class Streamer: NSObject, SCStreamOutput, SCStreamDelegate {
+    var stream: SCStream?
+    var config: SCStreamConfiguration?
+    let input = Input()
+    let queue = DispatchQueue(label: "gliff.stream", qos: .userInteractive)
+    let device: MTLDevice
+    let commands: MTLCommandQueue
+    let pipeline: MTLComputePipelineState
+    var cache: CVMetalTextureCache?
+    var pointsWidth = 1.0
+    // Owned by `queue`.
+    var latest: CVPixelBuffer?
+    var dirty = false
+    var granted = false
+    var wantKeyframe = true
+    var dual: Bool
+    var bitrate: Int, fps: Int, vbvMs: Int
+    var main: VTStream?, aux: VTStream?
+    init(dual: Bool, bitrate: Int, fps: Int, vbvMs: Int) throws {
+        self.dual = dual; self.bitrate = bitrate; self.fps = fps; self.vbvMs = vbvMs
+        guard let device = MTLCreateSystemDefaultDevice(), let commands = device.makeCommandQueue() else { throw NSError(domain: "Gliff.Stream", code: 1, userInfo: [NSLocalizedDescriptionKey: "Metal is unavailable"]) }
+        self.device = device; self.commands = commands
+        let library = try device.makeLibrary(source: splitSource, options: nil)
+        guard let function = library.makeFunction(name: "split") else { throw NSError(domain: "Gliff.Stream", code: 2) }
+        pipeline = try device.makeComputePipelineState(function: function)
+        super.init()
+        CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &cache)
+        // Fail before the session starts if this Mac cannot encode in hardware.
+        _ = try VTStream(64, 64, 1_000_000, 30, 250)
+    }
+    func start(_ requested: String, _ width: Int, _ height: Int, _ captureFps: Int) async {
+        guard CGPreflightScreenCaptureAccess() else {
+            _ = CGRequestScreenCaptureAccess()
+            fail("Screen Recording permission is required. Open Gliff on this Mac and enable it in System Settings > Privacy & Security > Screen & System Audio Recording, then reconnect.")
+        }
+        guard AXIsProcessTrusted() else {
+            fail("Accessibility permission is required to control this Mac. Enable Gliff in System Settings > Privacy & Security > Accessibility, then reconnect.")
+        }
+        do {
+            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+            guard let display = content.displays.first(where: { requested == "auto" ? $0.displayID == CGMainDisplayID() : String($0.displayID) == requested || "display-\($0.displayID)" == requested }) else {
+                fail("Display \(requested) was not found. Use gliff-server --outputs to list displays.")
+            }
+            input.display = display.displayID
+            let mode = CGDisplayCopyDisplayMode(display.displayID)
+            let bounds = CGDisplayBounds(display.displayID)
+            pointsWidth = bounds.width
+            let nativeWidth = mode?.pixelWidth ?? Int(bounds.width), nativeHeight = mode?.pixelHeight ?? Int(bounds.height)
+            let config = SCStreamConfiguration()
+            // Start at the display scaled into the requested box (never up).
+            let fit = min(1, min(Double(width) / Double(nativeWidth), Double(height) / Double(nativeHeight)))
+            config.width = max(2, Int(Double(nativeWidth) * fit) & ~1); config.height = max(2, Int(Double(nativeHeight) * fit) & ~1)
+            config.pixelFormat = kCVPixelFormatType_32BGRA
+            config.colorSpaceName = CGColorSpace.sRGB
+            config.minimumFrameInterval = CMTime(value: 1, timescale: Int32(max(captureFps, 1)))
+            config.queueDepth = 5; config.showsCursor = true
+            self.config = config
+            let filter = SCContentFilter(display: display, excludingWindows: [])
+            let stream = SCStream(filter: filter, configuration: config, delegate: self)
+            try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
+            self.stream = stream
+            event(["type": "ready", "output": "display-\(display.displayID)", "native_width": nativeWidth, "native_height": nativeHeight,
+                   "points_width": Int(bounds.width), "points_height": Int(bounds.height), "refresh": mode?.refreshRate ?? 0])
+            try await stream.startCapture()
+            DispatchQueue.main.async { clipboard.start() }
+        } catch { fail("Screen capture failed: \(error.localizedDescription)") }
+    }
+    func resize(_ width: Int, _ height: Int) {
+        guard let stream = stream, let config = config else { return }
+        let w = max(2, width & ~1), h = max(2, height & ~1)
+        if config.width == w && config.height == h { return }
+        config.width = w; config.height = h
+        Task { do { try await stream.updateConfiguration(config) } catch { fail("Could not resize capture: \(error.localizedDescription)") } }
+    }
+    // Commands from the bridge, already on `queue`.
+    func command(_ cmd: [String: Any]) {
+        switch cmd["type"] as? String {
+        case "frame":
+            granted = true
+            if cmd["keyframe"] as? Bool == true { wantKeyframe = true }
+            pump(refresh: false)
+        case "refresh":
+            pump(refresh: true)
+        case "rate":
+            bitrate = cmd["bitrate"] as? Int ?? bitrate; fps = cmd["fps"] as? Int ?? fps; vbvMs = cmd["vbv_ms"] as? Int ?? vbvMs
+            main?.setRate(bitrate, fps, vbvMs); aux?.setRate(bitrate, fps, vbvMs)
+        case "chroma":
+            let want = cmd["dual"] as? Bool ?? dual
+            if want != dual { dual = want; aux = nil; wantKeyframe = true }
+        default: break
+        }
+    }
+    func stream(_ stream: SCStream, didStopWithError error: Error) { fail("Screen capture stopped: \(error.localizedDescription)") }
+    func stream(_ stream: SCStream, didOutputSampleBuffer sample: CMSampleBuffer, of type: SCStreamOutputType) {
+        guard type == .screen, sample.isValid, let buffer = sample.imageBuffer else { return }
+        // Idle samples repeat the previous image.
+        if let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]], let raw = attachments.first?[.status] as? Int, raw != SCFrameStatus.complete.rawValue { return }
+        latest = buffer; dirty = true
+        pump(refresh: false)
+    }
+    // Encode the newest frame when the bridge has granted one; a refresh
+    // re-encodes the kept frame so a still screen sharpens.
+    func pump(refresh: Bool) {
+        guard granted, let frame = latest, dirty || refresh else { return }
+        let still = !dirty
+        granted = false; dirty = false
+        autoreleasepool { encode(frame, refresh: still) }
+    }
+    func texture(_ pixel: CVPixelBuffer, _ plane: Int, _ format: MTLPixelFormat) -> (CVMetalTexture, MTLTexture)? {
+        guard let cache = cache else { return nil }
+        let w = plane == 0 ? CVPixelBufferGetWidth(pixel) : CVPixelBufferGetWidthOfPlane(pixel, plane)
+        let h = plane == 0 ? CVPixelBufferGetHeight(pixel) : CVPixelBufferGetHeightOfPlane(pixel, plane)
+        var out: CVMetalTexture?
+        guard CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, cache, pixel, nil, format, w, h, plane, &out) == kCVReturnSuccess,
+              let out = out, let texture = CVMetalTextureGetTexture(out) else { return nil }
+        return (out, texture)
+    }
+    func surface(_ stream: VTStream) -> CVPixelBuffer? {
+        guard let pool = stream.pool else { return nil }
+        var pixel: CVPixelBuffer?
+        let limits = [kCVPixelBufferPoolAllocationThresholdKey: 4] as CFDictionary
+        guard CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(kCFAllocatorDefault, pool, limits, &pixel) == kCVReturnSuccess, let pixel = pixel else { return nil }
+        CVBufferSetAttachment(pixel, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, .shouldPropagate)
+        CVBufferSetAttachment(pixel, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2, .shouldPropagate)
+        CVBufferSetAttachment(pixel, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2, .shouldPropagate)
+        return pixel
+    }
+    func encode(_ frame: CVPixelBuffer, refresh: Bool) {
+        let started = DispatchTime.now().uptimeNanoseconds
+        let width = CVPixelBufferGetWidth(frame) & ~1, height = CVPixelBufferGetHeight(frame) & ~1
+        do {
+            if main?.width != width || main?.height != height { main = nil; aux = nil }
+            if main == nil { main = try VTStream(width, height, bitrate, fps, vbvMs); wantKeyframe = true }
+            if dual && aux == nil { aux = try VTStream(width, height, bitrate, fps, vbvMs); wantKeyframe = true }
+        } catch { fail("Hardware encoder failed: \(error.localizedDescription)") }
+        guard let main = main, let mainPixel = surface(main) else { return skip() }
+        let auxPixel = aux.flatMap { surface($0) }
+        if dual && auxPixel == nil { return skip() }
+        guard let src = texture(frame, 0, .bgra8Unorm), let my = texture(mainPixel, 0, .r8Unorm), let muv = texture(mainPixel, 1, .rg8Unorm),
+              let buffer = commands.makeCommandBuffer(), let encoder = buffer.makeComputeCommandEncoder() else { return skip() }
+        let ay = auxPixel.flatMap { texture($0, 0, .r8Unorm) }, auv = auxPixel.flatMap { texture($0, 1, .rg8Unorm) }
+        var hasAux: Int32 = auxPixel == nil ? 0 : 1
+        encoder.setComputePipelineState(pipeline)
+        encoder.setTexture(src.1, index: 0); encoder.setTexture(my.1, index: 1); encoder.setTexture(muv.1, index: 2)
+        encoder.setTexture(ay?.1 ?? my.1, index: 3); encoder.setTexture(auv?.1 ?? muv.1, index: 4)
+        encoder.setBytes(&hasAux, length: 4, index: 0)
+        let group = MTLSize(width: 16, height: 16, depth: 1)
+        let blocks = MTLSize(width: (width / 2 + 15) / 16, height: (height / 2 + 15) / 16, depth: 1)
+        encoder.dispatchThreadgroups(blocks, threadsPerThreadgroup: group)
+        encoder.endEncoding()
+        buffer.commit(); buffer.waitUntilCompleted()
+        withExtendedLifetime((src, my, muv, ay, auv)) {}
+        let key = wantKeyframe
+        let pts = CMClockGetTime(CMClockGetHostTimeClock())
+        var status = main.submit(mainPixel, pts, key)
+        if status == noErr, let aux = aux, let auxPixel = auxPixel { status = aux.submit(auxPixel, pts, key) }
+        main.complete(); aux?.complete()
+        guard status == noErr else { fail("Hardware encoding failed (\(status))") }
+        // A dropped plane would desynchronise the pair; resend both as a keyframe.
+        guard let mainData = main.output, auxPixel == nil || aux?.output != nil else { return skip() }
+        wantKeyframe = false
+        let auxData = auxPixel == nil ? Data() : aux?.output ?? Data()
+        var packetData = Data(capacity: 28 + mainData.count + auxData.count)
+        append((main.keyframe ? 1 : 0) | (refresh ? 2 : 0), &packetData)
+        append(UInt32(width), &packetData); append(UInt32(height), &packetData)
+        append(UInt32(max(1, Double(width) / pointsWidth * 1000)), &packetData)
+        append(UInt32(mainData.count), &packetData); append(UInt32(auxData.count), &packetData)
+        append(UInt32(min(UInt64(UInt32.max), (DispatchTime.now().uptimeNanoseconds - started) / 1000)), &packetData)
+        packetData.append(mainData); packetData.append(auxData)
+        packet(3, packetData)
+    }
+    // Nothing was coded: hand the grant back and start the next pair clean.
+    func skip() {
+        wantKeyframe = true
+        var empty = Data()
+        for _ in 0..<7 { append(0, &empty) }
+        packet(3, empty)
     }
 }
 
@@ -924,6 +1261,25 @@ if mode == "encode" {
     app.setActivationPolicy(.regular)
     let delegate = App(); app.delegate = delegate
     withExtendedLifetime(delegate) { app.run() }
+} else if mode == "stream" {
+    // display width height fps dual bitrate vbv_ms
+    app.setActivationPolicy(.accessory)
+    let args = Array(CommandLine.arguments.dropFirst(2))
+    guard args.count == 7, let width = Int(args[1]), let height = Int(args[2]), let fps = Int(args[3]), let bitrate = Int(args[5]), let vbv = Int(args[6]) else { fail("Invalid stream configuration") }
+    let streamer: Streamer
+    do { streamer = try Streamer(dual: args[4] == "1", bitrate: bitrate, fps: fps, vbvMs: vbv) }
+    catch { event(["type": "unsupported", "message": error.localizedDescription]); exit(2) }
+    readCommands(onClose: { streamer.input.handle(["type": "release"]) }) { _, data in
+        let cmd = json(data)
+        if clipboard.receive(cmd) { return }
+        switch cmd["type"] as? String {
+        case "frame", "refresh", "rate", "chroma": streamer.queue.async { streamer.command(cmd) }
+        case "resize": DispatchQueue.main.async { streamer.resize(cmd["width"] as? Int ?? 2, cmd["height"] as? Int ?? 2) }
+        default: DispatchQueue.main.async { streamer.input.handle(cmd); clipboard.command(cmd) }
+        }
+    }
+    Task { await streamer.start(args[0], width, height, fps) }
+    withExtendedLifetime(streamer) { app.run() }
 } else if mode == "capture" {
     app.setActivationPolicy(.accessory)
     let args = Array(CommandLine.arguments.dropFirst(2))

@@ -153,11 +153,18 @@ logical display coordinates. macOS hosts mirror physical screens and reject
 - The clipboard prefetches what the remote offers, since macOS reads the
   clipboard owner's data unprompted, and sends the Mac's clipboard when the
   window comes to the front.
-- Mac hosts prefer VideoToolbox hardware H.264 encoding for the default
-  single 4:2:0 stream, and verify that the session actually uses hardware.
-  OpenH264 is the fallback if hardware creation or encoding fails. Host
-  `--video cpu` forces software; `--full-chroma` uses the software dual-stream
-  4:4:4 path. Capture is capped at 1920×1200 and 30 fps.
+- Mac hosts stream like Linux hosts: Dual420 4:4:4 at up to 60 fps, at the
+  display's native pixels scaled into the client's window (at most
+  4096×2304). ScreenCaptureKit, a Metal split kernel (the twin of
+  gliff-vk's) and two VideoToolbox sessions run in one native process, so
+  no frame passes through the CPU. The server grants one encode at a time
+  and adapts bitrate, frame rate, chroma and size with the Linux server's
+  estimator, controller and ladder (`gliff-server/src/rate.rs`);
+  `--low-bandwidth` starts at 4:2:0. Without a hardware encoder the host
+  falls back to OpenH264 at 30 fps and at most 1920×1200, as does host
+  `--video cpu`. To debug a host session, start the server with
+  `GLIFF_HOST_LOG=/tmp/gliff-host.log` (and `RUST_LOG`): the host app,
+  launched through LaunchServices, writes its log there.
 - A client may ask for the cursor painted into the video
   (`cursor-in-video`). Linux hosts then skip the separate cursor capture
   session, avoiding Hyprland 0.56's cursor-session crash on display

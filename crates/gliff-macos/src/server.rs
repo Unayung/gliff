@@ -162,6 +162,26 @@ where
         writer.write_msg(&ServerMsg::error(code, text)).await?;
         bail!("{text}");
     }
+    let cpu = gliff_sw::VideoMode::resolve(cfg.video.as_deref()) == gliff_sw::VideoMode::Cpu;
+    if !cpu {
+        // The hardware stream codes 4:4:4 as cheaply as 4:2:0 used to cost
+        // on the CPU, and its ladder drops the aux stream when the link
+        // cannot pay for it.
+        let dual = caps.chroma.contains(&ChromaMode::Dual420)
+            && (!cfg.low_bandwidth || !caps.chroma.contains(&ChromaMode::Single420));
+        match crate::stream::spawn(&cfg.output, (caps.max_width, caps.max_height), dual).await {
+            Ok(Ok(native)) => {
+                return crate::stream::run(reader, writer, caps, dual, cfg.bitrate, native).await
+            }
+            Ok(Err(why)) => tracing::warn!(why, "no hardware stream; using the CPU encoder"),
+            Err(e) => {
+                writer
+                    .write_msg(&ServerMsg::error(256, format!("{e:#}")))
+                    .await?;
+                return Err(e);
+            }
+        }
+    }
     let dual = caps.chroma.contains(&ChromaMode::Dual420)
         && (cfg.full_chroma && !cfg.low_bandwidth || !caps.chroma.contains(&ChromaMode::Single420));
     let chroma = if dual {
@@ -205,7 +225,6 @@ where
         .bitrate
         .unwrap_or_else(|| width.saturating_mul(height).saturating_mul(8))
         .max(100_000);
-    let cpu = gliff_sw::VideoMode::resolve(cfg.video.as_deref()) == gliff_sw::VideoMode::Cpu;
     let mut encoder = Encoder::new(
         gliff_sw::EncoderSettings {
             width,
@@ -364,7 +383,7 @@ where
     result
 }
 
-fn input_command(msg: ClientMsg) -> Option<Value> {
+pub(crate) fn input_command(msg: ClientMsg) -> Option<Value> {
     Some(match msg {
         ClientMsg::Resize { width, height, .. } => {
             json!({"type":"resize", "width":width.clamp(2, 1920), "height":height.clamp(2, 1200)})

@@ -178,7 +178,8 @@ gliff --server-bin 'gliff-server --low-bandwidth' user@host
   The server then encodes on the CPU.
 - Screens wider than 4096 pixels are streamed at a reduced size and scaled
   back up.
-- Mac hosting is capped at 1920×1200 and 30 fps.
+- Mac hosting streams at most 4096×2304; without a hardware encoder it
+  falls back to OpenH264 at 1920×1200 and 30 fps.
 
 ## More
 

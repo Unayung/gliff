@@ -191,6 +191,15 @@ impl Instance {
         )
     }
 
+    /// Switch one monitor's DPMS on or off, leaving the others alone.
+    pub fn set_dpms(&self, monitor: &str, on: bool) -> Result<()> {
+        let action = if on { "on" } else { "off" };
+        self.dispatcher(
+            &format!("dpms {action} {monitor}"),
+            &format!("hl.dsp.dpms({{ action = \"{action}\", monitor = \"{monitor}\" }})"),
+        )
+    }
+
     pub fn get_option(&self, name: &str) -> Result<OptionValue> {
         self.request_json(&format!("getoption {name}"))
     }
@@ -271,6 +280,13 @@ pub struct Monitor {
     pub disabled: bool,
     #[serde(default)]
     pub active_workspace: WorkspaceRef,
+    /// False while DPMS has the monitor off; Hyprland does not render it.
+    #[serde(default = "yes")]
+    pub dpms_status: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// A workspace as a monitor refers to it.
@@ -368,6 +384,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(m.active_workspace.id, 4);
+        assert!(m.dpms_status, "a monitor without the field counts as on");
+        let m: Monitor = serde_json::from_str(
+            r#"{"id": 1, "name": "gliff-1", "width": 1280, "height": 712, "dpmsStatus": false}"#,
+        )
+        .unwrap();
+        assert!(!m.dpms_status);
     }
 
     #[test]

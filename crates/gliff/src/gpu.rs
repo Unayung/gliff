@@ -12,6 +12,16 @@ pub fn open() -> Result<std::sync::Arc<Gpu>, gliff_vk::Error> {
     Gpu::open(Some(&hypr_capture::render_node(None)))
 }
 
+/// Whether a decode error means this GPU cannot take the stream at all, so
+/// the worker should move to the CPU rather than ask for a keyframe.
+#[cfg(target_os = "linux")]
+pub fn is_unsupported(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<gliff_vk::Error>(),
+        Some(gliff_vk::Error::Unsupported(_))
+    )
+}
+
 #[cfg(target_os = "macos")]
 pub use gliff_mac::{Decoder, DisplayFrame, Gpu};
 
@@ -21,8 +31,16 @@ pub fn open() -> Result<std::sync::Arc<Gpu>, gliff_mac::Error> {
     Gpu::open()
 }
 
+#[cfg(target_os = "macos")]
+pub fn is_unsupported(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<gliff_mac::Error>(),
+        Some(gliff_mac::Error::Unsupported(_))
+    )
+}
+
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub use none::{open, Decoder, DisplayFrame, Gpu};
+pub use none::{is_unsupported, open, Decoder, DisplayFrame, Gpu};
 
 /// Stand-ins that can never be constructed, so the worker's GPU paths
 /// compile and are statically dead.
@@ -48,6 +66,10 @@ mod none {
 
     pub fn open() -> Result<Arc<Gpu>, Unsupported> {
         Err(Unsupported)
+    }
+
+    pub fn is_unsupported(_e: &anyhow::Error) -> bool {
+        false
     }
 
     pub enum DisplayFrame {}

@@ -15,6 +15,7 @@ bin/build
 opened, run `bin/install-dev` and choose **Gliff (Development)**; build
 failures raise a notification and are logged to `target/dev-build.log`. The
 remote end of an SSH session still runs the `gliff-server` installed there.
+The Omarchy and macOS builds share the [app icon](icon.md).
 
 Needs Rust, a C++ toolchain (the vendored OpenH264 build; nasm speeds it up),
 and the runtime libraries in the `pkgbuild/PKGBUILD` `depends`. The GPU tier
@@ -44,6 +45,25 @@ packet delays and compare its decoded pixels with the reference:
 ```
 gliff-probe --video cpu roundtrip --single --decode gpu --frame-delay-ms 300 --frames 20
 ```
+
+## macOS
+
+On macOS, `bin/build` builds the GTK client (with Homebrew's GTK 4 and
+libadwaita, VideoToolbox decoding and the Metal recombine in `gliff-mac`)
+and the native host (`gliff-macos`). It excludes the Linux-only probes,
+Wayland, Vulkan and VA-API. `bin/install-macos` installs the app and its
+SSH host for the current user; it also works through `bin/install`.
+
+The build needs Rust and Xcode Command Line Tools. `gliff-macos/build.rs`
+compiles the Swift bridge for the selected architecture (Apple Silicon or
+Intel), targeting macOS 13. The bridge is embedded in the binaries; installation
+writes that exact bridge into the app bundle and signs it locally.
+
+`scripts/check.sh` selects the portable and macOS packages on a Mac, and CI
+runs those checks plus a release build and downloadable development archive
+on Apple Silicon and Intel runners. Native capture and
+input need a logged-in desktop and OS permission grants, so they are tested on
+real hardware rather than in unattended CI. See [macos.md](macos.md).
 
 ## Run on one machine
 
@@ -140,3 +160,6 @@ pass. That merge starts package publishing. No manual version bump in
 Verify that the tagged CI run and GitHub release succeeded, then check the
 package update PR and publishing run in `omacom/omarchy-pkgs`. A green
 source release alone does not mean the package has finished publishing.
+Mac packages are built and notarized by CI with the maintainer signing
+credentials described in [macos.md](macos.md).
+

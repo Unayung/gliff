@@ -33,6 +33,8 @@ hypr-capture.workspace = true
 drm-fourcc.workspace = true
 hypr-input.workspace = true
 
-# VideoToolbox decode and the Metal recombine.
+# VideoToolbox decode and the Metal recombine; gliff-macos hosts this Mac,
+# which runs inside the app bundle (--host-bridge).
 [target.'cfg(target_os = "macos")'.dependencies]
 gliff-mac.workspace = true
+gliff-macos.workspace = true

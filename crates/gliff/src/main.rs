@@ -238,6 +238,10 @@ impl Session {
 }
 
 fn main() -> glib::ExitCode {
+    #[cfg(target_os = "macos")]
+    if let Some(code) = macos_native() {
+        return code;
+    }
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
@@ -257,6 +261,36 @@ fn main() -> glib::ExitCode {
     // GTK owns argv parsing; we already parsed with clap, so pass none.
     let empty: Vec<String> = vec![];
     app.run_with_args(&empty)
+}
+
+/// What the native macOS code (gliff-macos) handles instead of this GTK
+/// client: hosting this Mac, which runs in the app bundle LaunchServices
+/// starts (`--host-bridge`), and listing nearby computers (`--discover`).
+/// Otherwise GTK is pointed at Homebrew's data (schemas and icons) when
+/// nothing set XDG_DATA_DIRS, as when the app bundle is opened from Finder.
+#[cfg(target_os = "macos")]
+fn macos_native() -> Option<glib::ExitCode> {
+    let native = std::env::args()
+        .skip(1)
+        .any(|a| a == "--host-bridge" || a == "--discover" || a.starts_with("--check-frames"));
+    if native {
+        return Some(match gliff_macos::client_main() {
+            Ok(()) => glib::ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("gliff: {e:#}");
+                glib::ExitCode::FAILURE
+            }
+        });
+    }
+    if std::env::var_os("XDG_DATA_DIRS").is_none() {
+        let share = ["/opt/homebrew/share", "/usr/local/share"]
+            .into_iter()
+            .find(|d| std::path::Path::new(d).join("glib-2.0/schemas").is_dir());
+        if let Some(share) = share {
+            std::env::set_var("XDG_DATA_DIRS", share);
+        }
+    }
+    None
 }
 
 /// The endpoints named on the command line, if any.

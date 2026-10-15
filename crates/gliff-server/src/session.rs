@@ -43,6 +43,9 @@ pub struct Config {
     pub full_chroma: bool,
     /// What the capture ring is made of; `Shm` implies the CPU tier.
     pub capture: CaptureMode,
+    /// Move every workspace onto the headless output for the session, so
+    /// the remote's windows show in it, and put them back at the end.
+    pub move_workspaces: bool,
 }
 
 /// Events from the capture thread.
@@ -1464,6 +1467,16 @@ struct SessionOutput {
     /// Output scale; the logical size the pointer works in is size / scale.
     scale: f32,
     headless: Option<hypr_ipc::Instance>,
+    /// Workspaces moved onto the headless output, to put back.
+    borrowed: Option<Borrowed>,
+}
+
+/// Where the workspaces were before a session moved them onto its output.
+struct Borrowed {
+    /// Each moved workspace and the monitor it came from.
+    homes: Vec<(i64, String)>,
+    /// The workspace each other monitor was showing.
+    shown: Vec<(String, i64)>,
 }
 
 impl SessionOutput {
@@ -1507,8 +1520,68 @@ impl SessionOutput {
 
 impl Drop for SessionOutput {
     fn drop(&mut self) {
-        if let Some(instance) = &self.headless {
-            let _ = instance.remove_output(&self.name);
+        let Some(instance) = &self.headless else {
+            return;
+        };
+        // Put the workspaces back before the output goes; otherwise
+        // Hyprland piles them all onto one monitor.
+        if let Some(borrowed) = self.borrowed.take() {
+            return_workspaces(instance, &borrowed);
+        }
+        let _ = instance.remove_output(&self.name);
+    }
+}
+
+/// Move every regular workspace onto `output` and show there the one the
+/// main monitor was showing, recording where each came from.
+fn borrow_workspaces(instance: &hypr_ipc::Instance, output: &str) -> Result<Borrowed> {
+    let mons = instance.monitors()?;
+    let shown: Vec<(String, i64)> = mons
+        .iter()
+        .filter(|m| m.name != output && !m.disabled && m.active_workspace.id > 0)
+        .map(|m| (m.name.clone(), m.active_workspace.id))
+        .collect();
+    let front = main_monitor(&mons)
+        .filter(|m| m.name != output)
+        .map(|m| m.active_workspace.id);
+    let mut homes = Vec::new();
+    for ws in instance.workspaces()? {
+        if ws.id <= 0 || ws.monitor == output {
+            continue;
+        }
+        match instance.move_workspace_to_monitor(ws.id, output) {
+            Ok(()) => homes.push((ws.id, ws.monitor)),
+            Err(e) => tracing::warn!(workspace = ws.id, error = %e, "could not move workspace"),
+        }
+    }
+    if let Some(id) = front.filter(|id| homes.iter().any(|(w, _)| w == id)) {
+        if let Err(e) = instance.show_workspace(output, id) {
+            tracing::warn!(workspace = id, error = %e, "could not show workspace");
+        }
+    }
+    tracing::info!(
+        moved = homes.len(),
+        output,
+        "moved workspaces onto the session output"
+    );
+    Ok(Borrowed { homes, shown })
+}
+
+/// Undo `borrow_workspaces`: each workspace to its monitor, if that is
+/// still there, and each monitor back to what it showed.
+fn return_workspaces(instance: &hypr_ipc::Instance, borrowed: &Borrowed) {
+    let present: Vec<String> = instance
+        .monitors()
+        .map(|mons| mons.into_iter().map(|m| m.name).collect())
+        .unwrap_or_default();
+    for (id, home) in &borrowed.homes {
+        if present.contains(home) {
+            let _ = instance.move_workspace_to_monitor(*id, home);
+        }
+    }
+    for (monitor, id) in &borrowed.shown {
+        if present.contains(monitor) {
+            let _ = instance.show_workspace(monitor, *id);
         }
     }
 }
@@ -1585,6 +1658,7 @@ fn setup_output(
             } & !1,
             scale: m.scale,
             headless: None,
+            borrowed: None,
         });
     }
     let before: Vec<String> = instance.monitors()?.into_iter().map(|m| m.name).collect();
@@ -1599,6 +1673,7 @@ fn setup_output(
         height: 0,
         scale: 1.0,
         headless: Some(instance.clone()),
+        borrowed: None,
     };
     std::thread::sleep(Duration::from_millis(200));
     let after = instance.monitors()?;
@@ -1632,6 +1707,12 @@ fn setup_output(
     output.scale = scale;
     // An output added while the remote sleeps comes up switched off.
     output.keep_awake();
+    if cfg.move_workspaces {
+        match borrow_workspaces(instance, &output.name) {
+            Ok(borrowed) => output.borrowed = Some(borrowed),
+            Err(e) => tracing::warn!(error = %e, "could not move workspaces"),
+        }
+    }
     Ok(output)
 }
 

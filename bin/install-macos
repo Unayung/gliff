@@ -9,7 +9,10 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.cargo/bin:$PATH"
 GLIFF_DEST_APP="$HOME/Applications/Gliff.app"
 # Reuse the certificate chosen for this installation across future builds.
 # A fingerprint avoids ambiguous certificate names and needs no XML escaping.
-GLIFF_SIGNING_IDENTITY="${GLIFF_CODESIGN_IDENTITY:-$(/usr/libexec/PlistBuddy -c 'Print :GliffSigningIdentity' "$GLIFF_DEST_APP/Contents/Info.plist" 2>/dev/null || printf '-')}"
+# PlistBuddy reports a missing file or key on stdout, so only its success
+# counts.
+GLIFF_SAVED_IDENTITY=$(/usr/libexec/PlistBuddy -c 'Print :GliffSigningIdentity' "$GLIFF_DEST_APP/Contents/Info.plist" 2>/dev/null) || GLIFF_SAVED_IDENTITY=-
+GLIFF_SIGNING_IDENTITY="${GLIFF_CODESIGN_IDENTITY:-$GLIFF_SAVED_IDENTITY}"
 case "$GLIFF_SIGNING_IDENTITY" in
     -) ;;
     *[!a-fA-F0-9]*|'') echo 'GLIFF_CODESIGN_IDENTITY must be a certificate SHA-1 fingerprint.' >&2; exit 1 ;;

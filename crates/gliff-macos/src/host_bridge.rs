@@ -96,7 +96,8 @@ pub async fn relay(config: &crate::server::Cli) -> Result<()> {
     let dir = SocketDir(dir);
     let path = dir.0.join("s");
     let listener = tokio::net::UnixListener::bind(&path)?;
-    let exe = std::env::current_exe()?;
+    // Through the ~/.local/bin link, the path names the link, not the bundle.
+    let exe = std::env::current_exe()?.canonicalize()?;
     let bundle = exe
         .parent()
         .and_then(|p| p.parent())

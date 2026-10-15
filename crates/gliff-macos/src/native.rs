@@ -64,7 +64,7 @@ pub fn helper_path() -> Result<std::path::PathBuf> {
         hash::{Hash, Hasher},
     };
     let embedded = include_bytes!(concat!(env!("OUT_DIR"), "/gliff-native"));
-    let exe = std::env::current_exe()?;
+    let exe = std::env::current_exe()?.canonicalize()?;
     let sibling = exe.parent().unwrap().join("gliff-native");
     let path = if sibling.is_file() {
         sibling

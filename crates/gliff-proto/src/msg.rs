@@ -41,6 +41,11 @@ pub const FEATURES: &[&str] = &[FEATURE_AUDIO];
 /// capture.
 pub const FEATURE_AUDIO: &str = "audio";
 
+/// A request in the client's list rather than a capability: give a headless
+/// output the host's workspaces for the session, as `--move-workspaces`
+/// does. Asked this way, a server too old to move them still connects.
+pub const FEATURE_MOVE_WORKSPACES: &str = "move-workspaces";
+
 /// Request cursor pixels inside video instead of separate cursor messages.
 /// Listed by clients that need this mode and servers that can provide it.
 pub const FEATURE_CURSOR_IN_VIDEO: &str = "cursor-in-video";

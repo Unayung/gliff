@@ -24,12 +24,12 @@ reconnection. Open Gliff and enter an SSH address, or run:
 
 ```
 ~/.local/bin/gliff user@linux-host
-~/.local/bin/gliff --headless --move-workspaces user@linux-host
+~/.local/bin/gliff --mirror user@linux-host
 ```
 
-The Linux host needs Gliff installed and a running Hyprland session. The
-`--headless` option creates a private screen there and follows the Mac window;
-`--move-workspaces` brings the host's workspaces onto it for the session.
+The Linux host needs Gliff installed and a running Hyprland session. By
+default it gets a screen that follows the Mac window, and its workspaces move
+onto it for the session; `--mirror` shows its focused screen instead.
 `gliff --discover` lists nearby Gliff desktops as JSON. The app asks for
 Local Network access on macOS versions that require it; enable Gliff under
 System Settings → Privacy & Security → Local Network.
@@ -135,8 +135,8 @@ gliff --output display-1 user@mac-host
 
 Display IDs come from the Mac; use the ID listed by `--outputs`. A mirrored
 stream fits the client's window while pointer coordinates remain in the Mac's
-logical display coordinates. macOS hosts mirror physical screens and reject
-`--headless` with a clear error.
+logical display coordinates. macOS hosts mirror physical screens; asked for
+a screen of their own (the client's default), they mirror the main display.
 
 ## Current differences from Linux
 
@@ -144,7 +144,7 @@ logical display coordinates. macOS hosts mirror physical screens and reject
   aux at the same time, and a Metal kernel (`gliff-mac`) recombines 4:4:4,
   matching the CPU reference bit for bit. It falls back to OpenH264 when the
   GPU path is unavailable.
-- On a Retina display the header's 1x button renders a headless remote at 1x
+- On a Retina display the header's 1x button renders the remote's screen at 1x
   and enlarges it by whole pixels, a quarter of the bandwidth.
 - Command maps to Super; Option maps to Alt. Hardware key positions are
   translated between macOS and evdev. Keyboard layouts use US on a Hyprland

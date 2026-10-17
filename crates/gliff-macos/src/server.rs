@@ -25,10 +25,15 @@ pub(crate) struct Cli {
     stdio: bool,
     #[arg(long)]
     listen: Option<String>,
-    #[arg(long, default_value = "auto", conflicts_with = "headless")]
+    #[arg(long, default_value = "auto")]
     output: String,
+    /// Asked for by clients by default. A Mac cannot add a screen, so the
+    /// main display is mirrored, scaled to the window as always.
     #[arg(long)]
     headless: bool,
+    /// Accepted with --headless; a Mac has no workspaces to move.
+    #[arg(long, hide = true)]
+    move_workspaces: bool,
     #[arg(long)]
     low_bandwidth: bool,
     #[arg(long)]
@@ -139,13 +144,7 @@ where
         }
     };
     if cfg.headless {
-        writer
-            .write_msg(&ServerMsg::error(
-                256,
-                "macOS supports mirroring physical displays; --headless requires a Hyprland host",
-            ))
-            .await?;
-        bail!("macOS does not provide Hyprland headless outputs");
+        tracing::info!("no private screens on macOS; mirroring the main display");
     }
     let error = if !caps.codecs.contains(&Codec::H264) {
         Some((ERROR_NO_CODEC, "No video codec in common"))

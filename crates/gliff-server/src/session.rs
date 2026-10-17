@@ -1739,7 +1739,12 @@ fn setup_output(
     output.scale = scale;
     // An output added while the remote sleeps comes up switched off.
     output.keep_awake();
-    if cfg.move_workspaces {
+    if cfg.move_workspaces
+        || caps
+            .features
+            .iter()
+            .any(|f| f == gliff_proto::FEATURE_MOVE_WORKSPACES)
+    {
         match borrow_workspaces(instance, &output.name) {
             Ok(borrowed) => output.borrowed = Some(borrowed),
             Err(e) => tracing::warn!(error = %e, "could not move workspaces"),

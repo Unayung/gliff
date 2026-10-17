@@ -15,6 +15,7 @@ clap.workspace = true
 gliff-proto.workspace = true
 gliff-transport.workspace = true
 gliff-sw.workspace = true
+gliff-audio = { workspace = true, features = ["player"] }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

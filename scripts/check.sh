@@ -7,7 +7,7 @@ cd "$(dirname "$0")/.."
 
 packages=(--workspace)
 if [ "$(uname -s)" = Darwin ]; then
-    packages=(-p gliff-proto -p gliff-transport -p gliff-sw -p gliff-mac -p gliff-macos -p hypr-ipc -p gliff -p gliff-server)
+    packages=(-p gliff-proto -p gliff-transport -p gliff-sw -p gliff-audio -p gliff-mac -p gliff-macos -p hypr-ipc -p gliff -p gliff-server)
 fi
 
 if [ "${1:-}" = "--fix" ]; then

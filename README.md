@@ -21,6 +21,8 @@ currently decode on the CPU.
   layout; Mac clients use physical key positions and the host layout.
 - Shared text clipboard in both directions. Linux-to-Linux sessions also
   transfer images and copied files.
+- The remote machine's sound, in both directions, so two machines can show
+  each other at once without echo.
 - Linux hosts adapt quality to the link, giving up frame rate before sharpness.
 - Linux viewers provide tabs, reconnection, and your Omarchy theme. Mac
   viewers use a native window with one connection.
@@ -30,6 +32,8 @@ currently decode on the CPU.
 - Linux with Hyprland, or macOS 13 Ventura or later, on either end.
 - A logged-in desktop session on the remote machine. On a Mac host, grant
   Screen Recording and Accessibility to Gliff.
+- For sound from a Linux host: PipeWire (`pw-record`, `pw-dump`, `pw-link`),
+  or PulseAudio's `parec`.
 - ssh access from your machine to the remote one.
 - For GPU video: an AMD or Intel GPU with its Vulkan and VA-API drivers
   (on Arch, `vulkan-radeon` and `mesa` for AMD, or `vulkan-intel` and
@@ -148,6 +152,14 @@ Clipboard sharing trusts every connected host: a host can request the
 advertised clipboard contents without a local paste. Use `gliff --no-clipboard`
 to disable sharing in both directions when connecting to an untrusted host.
 Local selections marked `x-kde-passwordManagerHint` are not shared.
+
+**Sound.** The window plays the sound of the machine it shows. The speaker
+button in the header mutes it and remembers that; `gliff --no-audio` starts
+muted. Only the tab you look at plays, and other tabs' hosts stop recording.
+A host sends what its applications play except Gliff itself, so when two
+machines show each other, neither hears its own sound come back. Hosts keep
+playing their sound on their own speakers. Sound is Opus at 128 kbit/s, and
+the client buffers 40 to 250 ms of it, more on a jittery link.
 
 **Slow links.** gliff measures the link and lowers the frame rate, then the
 colour detail, then the resolution, and raises them again when there is

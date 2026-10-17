@@ -20,6 +20,7 @@ libadwaita.workspace = true
 gliff-proto.workspace = true
 gliff-transport.workspace = true
 gliff-sw.workspace = true
+gliff-audio = { workspace = true, features = ["player"] }
 hypr-ipc.workspace = true
 bytes.workspace = true
 serde.workspace = true

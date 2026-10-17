@@ -5,6 +5,7 @@ import CoreVideo
 import ApplicationServices
 import VideoToolbox
 import Metal
+import CoreAudio
 
 // stdout belongs exclusively to the bridge. Diagnostics go to stderr.
 let outputLock = NSLock()
@@ -516,11 +517,21 @@ final class VTStream {
     deinit { close() }
 }
 
-final class Streamer: NSObject, SCStreamOutput, SCStreamDelegate {
+// Its state is split between `queue`, `audioQueue` and the main thread.
+final class Streamer: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
     var stream: SCStream?
     var config: SCStreamConfiguration?
     let input = Input()
     let queue = DispatchQueue(label: "gliff.stream", qos: .userInteractive)
+    // Sound has its own stream, started when the bridge first wants it. Its
+    // filter leaves out Gliff's own apps, so a local Gliff client's playback
+    // of the other machine is never sent back to it.
+    let audioQueue = DispatchQueue(label: "gliff.audio", qos: .userInteractive)
+    var audioOn = false  // Owned by `audioQueue`.
+    var display: SCDisplay?
+    var audioStream: SCStream?
+    var audioStarted = false  // Main thread.
+    var excluded: Set<pid_t> = []
     let device: MTLDevice
     let commands: MTLCommandQueue
     let pipeline: MTLComputePipelineState
@@ -573,6 +584,7 @@ final class Streamer: NSObject, SCStreamOutput, SCStreamDelegate {
             config.minimumFrameInterval = CMTime(value: 1, timescale: Int32(max(captureFps, 1)))
             config.queueDepth = 5; config.showsCursor = true
             self.config = config
+            self.display = display
             let filter = SCContentFilter(display: display, excludingWindows: [])
             let stream = SCStream(filter: filter, configuration: config, delegate: self)
             try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
@@ -610,11 +622,73 @@ final class Streamer: NSObject, SCStreamOutput, SCStreamDelegate {
     }
     func stream(_ stream: SCStream, didStopWithError error: Error) { fail("Screen capture stopped: \(error.localizedDescription)") }
     func stream(_ stream: SCStream, didOutputSampleBuffer sample: CMSampleBuffer, of type: SCStreamOutputType) {
+        if stream === audioStream { if type == .audio && audioOn { sendAudio(sample) }; return }
         guard type == .screen, sample.isValid, let buffer = sample.imageBuffer else { return }
         // Idle samples repeat the previous image.
         if let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]], let raw = attachments.first?[.status] as? Int, raw != SCFrameStatus.complete.rawValue { return }
         latest = buffer; dirty = true
         pump(refresh: false)
+    }
+    // Gliff's own apps, which the sound leaves out.
+    func gliffApps(_ content: SCShareableContent) -> [SCRunningApplication] {
+        content.applications.filter { $0.bundleIdentifier == Bundle.main.bundleIdentifier || $0.applicationName.lowercased() == "gliff" }
+    }
+    func startAudio() async {
+        guard !audioStarted, let display = display else { return }
+        audioStarted = true
+        do {
+            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+            let apps = gliffApps(content)
+            let config = SCStreamConfiguration()
+            // The picture is unused; keep it as small and slow as allowed.
+            config.width = 2; config.height = 2
+            config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
+            config.capturesAudio = true; config.sampleRate = 48000; config.channelCount = 2
+            config.excludesCurrentProcessAudio = true
+            let stream = SCStream(filter: SCContentFilter(display: display, excludingApplications: apps, exceptingWindows: []), configuration: config, delegate: self)
+            try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: audioQueue)
+            try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioQueue)
+            audioStream = stream; excluded = Set(apps.map { $0.processID })
+            try await stream.startCapture()
+            // A Gliff client opened later must drop out of the sound too.
+            Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in Task { await self?.refreshAudioFilter() } }
+        } catch { diagnostic("System audio capture failed: \(error.localizedDescription)") }
+    }
+    func refreshAudioFilter() async {
+        guard let stream = audioStream, let display = display,
+              let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false) else { return }
+        let apps = gliffApps(content), pids = Set(apps.map { $0.processID })
+        if pids == excluded { return }
+        excluded = pids
+        try? await stream.updateContentFilter(SCContentFilter(display: display, excludingApplications: apps, exceptingWindows: []))
+    }
+    // System sound as packet 5: interleaved f32 stereo at 48 kHz, whatever
+    // layout ScreenCaptureKit delivers it in.
+    func sendAudio(_ sample: CMSampleBuffer) {
+        guard sample.isValid, let format = sample.formatDescription,
+              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(format)?.pointee,
+              asbd.mFormatID == kAudioFormatLinearPCM, asbd.mFormatFlags & kAudioFormatFlagIsFloat != 0,
+              asbd.mBitsPerChannel == 32, asbd.mSampleRate == 48000, asbd.mChannelsPerFrame > 0 else { return }
+        let frames = sample.numSamples, channels = Int(asbd.mChannelsPerFrame)
+        let planar = asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved != 0
+        var out = Data(count: frames * 8)
+        do {
+            try sample.withAudioBufferList { list, _ in
+                out.withUnsafeMutableBytes { raw in
+                    let dst = raw.bindMemory(to: Float32.self)
+                    if planar {
+                        guard let l = list[0].mData?.assumingMemoryBound(to: Float32.self),
+                              let r = list[min(1, list.count - 1)].mData?.assumingMemoryBound(to: Float32.self) else { return }
+                        for i in 0..<frames { dst[2 * i] = l[i]; dst[2 * i + 1] = r[i] }
+                    } else {
+                        guard let src = list[0].mData?.assumingMemoryBound(to: Float32.self) else { return }
+                        let right = min(1, channels - 1)
+                        for i in 0..<frames { dst[2 * i] = src[i * channels]; dst[2 * i + 1] = src[i * channels + right] }
+                    }
+                }
+            }
+        } catch { return }
+        packet(5, out)
     }
     // Encode the newest frame when the bridge has granted one; a refresh
     // re-encodes the kept frame so a still screen sharpens.
@@ -1274,6 +1348,10 @@ if mode == "encode" {
         if clipboard.receive(cmd) { return }
         switch cmd["type"] as? String {
         case "frame", "refresh", "rate", "chroma": streamer.queue.async { streamer.command(cmd) }
+        case "audio":
+            let on = cmd["enabled"] as? Bool ?? false
+            streamer.audioQueue.async { streamer.audioOn = on }
+            if on { DispatchQueue.main.async { Task { @MainActor in await streamer.startAudio() } } }
         case "resize": DispatchQueue.main.async { streamer.resize(cmd["width"] as? Int ?? 2, cmd["height"] as? Int ?? 2) }
         default: DispatchQueue.main.async { streamer.input.handle(cmd); clipboard.command(cmd) }
         }

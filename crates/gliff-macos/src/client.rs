@@ -42,6 +42,9 @@ struct Cli {
     /// Decode a fixed number of frames without opening a window (integration test).
     #[arg(long)]
     check_frames: Option<u32>,
+    /// Do not play the remote's sound.
+    #[arg(long)]
+    no_audio: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -90,7 +93,7 @@ pub fn client_main() -> Result<()> {
             let stream = tokio::net::TcpStream::connect(addr).await?;
             stream.set_nodelay(true)?;
             let (rd, wr) = tokio::io::split(stream);
-            session(rd, wr, &host, cli.check_frames).await
+            session(rd, wr, &host, cli.check_frames, !cli.no_audio).await
         } else {
             selected.validate()?;
             let mut target = SshTarget::new(host.clone());
@@ -108,14 +111,21 @@ pub fn client_main() -> Result<()> {
                 target.server_args.extend(["--output".into(), output]);
             }
             let mut ssh = spawn_ssh(&target)?;
-            let result = session(ssh.stdout, ssh.stdin, &host, cli.check_frames).await;
+            let result = session(
+                ssh.stdout,
+                ssh.stdin,
+                &host,
+                cli.check_frames,
+                !cli.no_audio,
+            )
+            .await;
             let _ = ssh.child.kill().await;
             result
         }
     })
 }
 
-async fn session<R, W>(rd: R, wr: W, host: &str, check: Option<u32>) -> Result<()>
+async fn session<R, W>(rd: R, wr: W, host: &str, check: Option<u32>, audio: bool) -> Result<()>
 where
     R: AsyncRead + Unpin + 'static,
     W: AsyncWrite + Unpin + 'static,
@@ -203,6 +213,7 @@ where
     let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_id = 0;
+    let mut sound = gliff_audio::Sink::default();
     let clipboard =
         crate::clipboard::Bridge::new(gliff_transport::clipboard::Side::Client, display_tx.clone());
     let mut clips = clipboard.take_outbound();
@@ -244,6 +255,9 @@ where
                         ServerMsg::HelloAck { version, session, features, .. } => {
                             ensure!(version == PROTOCOL_VERSION, "incompatible server protocol {version}");
                             got_hello = true;
+                            if audio && helper.is_some() && features.iter().any(|f| f == gliff_proto::FEATURE_AUDIO) {
+                                out.send((ClientMsg::Audio { enabled: true }, Bytes::new())).await?;
+                            }
                             if helper.is_some() {
                                 let command = json!({"type":"cursor_mode", "embedded":cursor_in_video(session.headless, &features)});
                                 display_tx.send((native::EVENT, serde_json::to_vec(&command)?)).await?;
@@ -273,6 +287,8 @@ where
                             out.send((ClientMsg::FrameAck { frame_id, decoded_at_ms: now_ms() }, Bytes::new())).await?;
                         }
                         ServerMsg::Ping { t } => { out.send((ClientMsg::Pong { t }, Bytes::new())).await?; }
+                        ServerMsg::AudioStart { codec, sample_rate, channels } => sound.start(codec == gliff_proto::AudioCodec::Opus, sample_rate, channels),
+                        ServerMsg::AudioFrame { seq, .. } => sound.frame(seq, &payload),
                         ServerMsg::Error { code, message, .. } => bail!("{}: {message}", if is_incompatible(code) { "incompatible server" } else { "server error" }),
                         _ => {}
                     }
@@ -396,6 +412,7 @@ fn server_payload(m: &ServerMsg) -> u32 {
         } => data_len.saturating_add(*aux_len),
         ServerMsg::CursorShape { argb_len, .. } => *argb_len,
         ServerMsg::ClipboardData { data_len, .. } => *data_len,
+        ServerMsg::AudioFrame { data_len, .. } => *data_len,
         _ => 0,
     }
 }
@@ -475,7 +492,7 @@ mod tests {
                 });
                 let result = tokio::time::timeout(
                     Duration::from_secs(3),
-                    session(client_rd, client_wr, "fixture", Some(4)),
+                    session(client_rd, client_wr, "fixture", Some(4), false),
                 )
                 .await?;
                 server.abort();
@@ -519,7 +536,7 @@ mod tests {
                     }
                     anyhow::bail!("unexpected idle input")
                 });
-                let result = session(client_rd, client_wr, "idle", Some(1)).await;
+                let result = session(client_rd, client_wr, "idle", Some(1), false).await;
                 assert!(result
                     .unwrap_err()
                     .to_string()
@@ -537,7 +554,7 @@ mod tests {
                 let (client, _silent_peer) = tokio::io::duplex(65536);
                 let (rd, wr) = tokio::io::split(client);
                 let started = tokio::time::Instant::now();
-                let result = session(rd, wr, "silent", Some(1)).await;
+                let result = session(rd, wr, "silent", Some(1), false).await;
                 assert!(result
                     .unwrap_err()
                     .to_string()

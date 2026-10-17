@@ -423,6 +423,8 @@ where
     );
     let mut clips = clipboard.take_outbound();
     let mut frame_id = 0_u64;
+    // The client's sound while it has it on: the encoder and the packet count.
+    let mut sound: Option<(gliff_audio::Encoder, u32)> = None;
     let result: Result<()> = async {
         loop {
             // Grant the next encode when the link has room and the pace slot
@@ -507,6 +509,20 @@ where
                         }
                         ClientMsg::Ping { t } => writer.write_msg(&ServerMsg::Pong { t, server_now_ms: now_ms() }).await?,
                         ClientMsg::Pong { t } => p.link.seed_rtt(Instant::now(), now_ms().saturating_sub(t) as f64),
+                        ClientMsg::Audio { enabled } => {
+                            if enabled && sound.is_none() {
+                                sound = Some((gliff_audio::Encoder::new()?, 0));
+                                writer.write_msg(&ServerMsg::AudioStart {
+                                    codec: gliff_proto::AudioCodec::Opus,
+                                    sample_rate: gliff_audio::SAMPLE_RATE,
+                                    channels: gliff_audio::CHANNELS as u32,
+                                }).await?;
+                            } else if !enabled {
+                                sound = None;
+                            }
+                            tracing::info!(enabled, "audio");
+                            command_tx.send(json!({"type": "audio", "enabled": enabled})).await?;
+                        }
                         ClientMsg::Resize { width, height, .. } => {
                             let w = width.min(p.caps.max_width) & !1;
                             let h = height.min(p.caps.max_height) & !1;
@@ -533,6 +549,16 @@ where
                             Some("clipboard") => clipboard.local(&ev).await?,
                             Some("paste") => clipboard.paste(&ev),
                             _ => {}
+                        }
+                        continue;
+                    }
+                    if kind == native::AUDIO {
+                        if let Some((encoder, seq)) = &mut sound {
+                            let pcm: Vec<f32> = bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+                            for packet in encoder.push(&pcm)? {
+                                writer.write_msg_with_payloads(&ServerMsg::AudioFrame { seq: *seq, data_len: packet.len() as u32 }, &[&packet]).await?;
+                                *seq = seq.wrapping_add(1);
+                            }
                         }
                         continue;
                     }

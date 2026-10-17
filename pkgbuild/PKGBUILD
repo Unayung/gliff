@@ -9,6 +9,7 @@ license=('MIT' 'BSD-2-Clause')
 install='gliff.install'
 options=('!debug' '!lto')
 depends=(
+  'alsa-lib'
   'avahi'
   'dbus'
   'gcc-libs'
@@ -21,11 +22,12 @@ depends=(
   'libxkbcommon'
   'mesa'
   'openssh'
+  'pipewire'
   'python'
   'vulkan-icd-loader'
   'wayland'
 )
-makedepends=('cargo' 'pkgconf' 'nasm')
+makedepends=('cargo' 'pkgconf' 'nasm' 'cmake')
 optdepends=('vulkan-radeon: Vulkan compute on AMD'
             'vulkan-intel: Vulkan compute on Intel'
             'intel-media-driver: VA-API H.264 codec on Intel'

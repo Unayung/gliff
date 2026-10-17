@@ -20,6 +20,9 @@ pub struct Config {
     /// The highest scale a headless output renders at; see --max-scale.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_scale: Option<f64>,
+    /// The header's sound button is off: no tab plays its machine's sound.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub muted: bool,
 }
 
 impl Config {

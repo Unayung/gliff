@@ -8,6 +8,8 @@ pub const PIXELS: u8 = 1;
 pub const EVENT: u8 = 2;
 pub const H264: u8 = 3;
 pub const ENCODE: u8 = 4;
+/// System sound from the stream host: interleaved f32 stereo at 48 kHz.
+pub const AUDIO: u8 = 5;
 pub const MAX_PACKET: usize = 64 * 1024 * 1024;
 
 pub async fn read<R: AsyncRead + Unpin>(rd: &mut R) -> Result<(u8, Vec<u8>)> {

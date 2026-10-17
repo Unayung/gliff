@@ -10,6 +10,7 @@ members = [
     "crates/gliff-va",
     "crates/gliff-vk",
     "crates/gliff-sw",
+    "crates/gliff-audio",
     "crates/gliff-mac",
     "crates/gliff-macos",
     "crates/gliff",
@@ -39,10 +40,13 @@ hypr-input = { path = "crates/hypr-input" }
 gliff-va = { path = "crates/gliff-va" }
 gliff-vk = { path = "crates/gliff-vk" }
 gliff-sw = { path = "crates/gliff-sw" }
+gliff-audio = { path = "crates/gliff-audio" }
 gliff-mac = { path = "crates/gliff-mac" }
 gliff-macos = { path = "crates/gliff-macos" }
 openh264 = { version = "0.9", features = ["source"] }
 openh264-sys2 = "0.9"
+opus = "0.4"
+cpal = "0.18"
 
 anyhow = "1"
 thiserror = "2"

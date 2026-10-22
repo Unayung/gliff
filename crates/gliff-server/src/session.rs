@@ -255,9 +255,6 @@ where
         cursor_shape_id: 0,
     };
 
-    // How often a headless output is checked for having been switched off.
-    let mut awake = tokio::time::interval(Duration::from_secs(2));
-    awake.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         let flow = tokio::select! {
             msg = msg_rx.recv() => match msg {
@@ -312,10 +309,6 @@ where
             _ = tokio::time::sleep_until(tokio::time::Instant::from_std(session.refine_wake())),
                 if session.can_refine() =>
             {
-                ControlFlow::Continue(())
-            }
-            _ = awake.tick(), if session.output.is_headless() => {
-                session.output.keep_awake();
                 ControlFlow::Continue(())
             }
             // The pace timer: fires when a frame waits only on the cadence.
@@ -1457,6 +1450,53 @@ impl VideoEncoder {
     }
 }
 
+/// Blocking compositor IPC stays off the single-threaded streaming runtime.
+/// One worker per headless output also prevents overlapping slow polls.
+struct KeepAwake {
+    stop: std::sync::mpsc::Sender<()>,
+    task: Option<std::thread::JoinHandle<()>>,
+}
+
+impl KeepAwake {
+    fn start(instance: hypr_ipc::Instance, name: String) -> std::io::Result<Self> {
+        Self::poll(Duration::from_secs(2), move || match instance.monitors() {
+            Ok(mons) if mons.iter().any(|m| m.name == name && !m.dpms_status) => {
+                if let Err(e) = instance.set_dpms(&name, true) {
+                    tracing::warn!(error = %e, "could not switch the headless output on");
+                }
+            }
+            Ok(_) => {}
+            Err(e) => tracing::debug!(error = %e, "cannot read the output's DPMS state"),
+        })
+    }
+
+    fn poll(every: Duration, mut check: impl FnMut() + Send + 'static) -> std::io::Result<Self> {
+        use std::sync::mpsc::{channel, RecvTimeoutError};
+        let (stop, rx) = channel();
+        let task = std::thread::Builder::new()
+            .name("gliff-output-awake".into())
+            .spawn(move || loop {
+                check();
+                if !matches!(rx.recv_timeout(every), Err(RecvTimeoutError::Timeout)) {
+                    break;
+                }
+            })?;
+        Ok(Self {
+            stop,
+            task: Some(task),
+        })
+    }
+}
+
+impl Drop for KeepAwake {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(task) = self.task.take() {
+            let _ = task.join();
+        }
+    }
+}
+
 /// The output being served. A created headless output is removed on drop, on
 /// every exit path including a failure later in setup.
 struct SessionOutput {
@@ -1467,12 +1507,16 @@ struct SessionOutput {
     /// Output scale; the logical size the pointer works in is size / scale.
     scale: f32,
     headless: Option<hypr_ipc::Instance>,
+    awake: Option<KeepAwake>,
     /// Workspaces moved onto the headless output, to put back.
     borrowed: Option<Borrowed>,
 }
 
 /// Where the workspaces were before a session moved them onto its output.
 struct Borrowed {
+    /// Held for the full borrow/restore lifetime, across every server process.
+    _lease: std::fs::File,
+    output: String,
     /// Each moved workspace and the monitor it came from.
     homes: Vec<(i64, String)>,
     /// The workspace each other monitor was showing.
@@ -1482,30 +1526,6 @@ struct Borrowed {
 impl SessionOutput {
     fn is_headless(&self) -> bool {
         self.headless.is_some()
-    }
-
-    /// Switch a headless output back on when something switched it off, as
-    /// an idle daemon's `dpms off` does to every monitor before it locks.
-    /// Hyprland does not render an output with DPMS off, so the stream would
-    /// freeze on black, lock screen included. Only this output is touched:
-    /// the remote's own screens keep their state.
-    fn keep_awake(&self) {
-        let Some(instance) = &self.headless else {
-            return;
-        };
-        let off = match instance.monitors() {
-            Ok(mons) => mons.iter().any(|m| m.name == self.name && !m.dpms_status),
-            Err(e) => {
-                tracing::debug!(error = %e, "cannot read the output's DPMS state");
-                false
-            }
-        };
-        if off {
-            tracing::info!(output = %self.name, "headless output was switched off; switching it on");
-            if let Err(e) = instance.set_dpms(&self.name, true) {
-                tracing::warn!(error = %e, "could not switch the headless output on");
-            }
-        }
     }
 
     /// The logical extent Hyprland exposes to clients and the virtual pointer.
@@ -1520,6 +1540,7 @@ impl SessionOutput {
 
 impl Drop for SessionOutput {
     fn drop(&mut self) {
+        drop(self.awake.take());
         let Some(instance) = &self.headless else {
             return;
         };
@@ -1532,9 +1553,24 @@ impl Drop for SessionOutput {
     }
 }
 
+/// A compositor has one set of workspaces. Keep a compositor-wide lease so
+/// another remote client cannot borrow them again or undo our restoration.
+fn workspace_lease(instance: &hypr_ipc::Instance) -> Result<std::fs::File> {
+    let lease = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(instance.dir.join("gliff-workspaces.lock"))?;
+    rustix::fs::flock(&lease, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+        .context("another gliff session already holds the remote workspaces")?;
+    Ok(lease)
+}
+
 /// Move every regular workspace onto `output` and show there the one the
 /// main monitor was showing, recording where each came from.
 fn borrow_workspaces(instance: &hypr_ipc::Instance, output: &str) -> Result<Borrowed> {
+    let lease = workspace_lease(instance)?;
     let mons = instance.monitors()?;
     let shown: Vec<(String, i64)> = mons
         .iter()
@@ -1546,7 +1582,7 @@ fn borrow_workspaces(instance: &hypr_ipc::Instance, output: &str) -> Result<Borr
         .map(|m| m.active_workspace.id);
     let mut homes = Vec::new();
     for ws in instance.workspaces()? {
-        if ws.id <= 0 || ws.monitor == output {
+        if ws.id <= 0 || ws.monitor == output || ws.monitor.starts_with("gliff-") {
             continue;
         }
         match instance.move_workspace_to_monitor(ws.id, output) {
@@ -1564,7 +1600,12 @@ fn borrow_workspaces(instance: &hypr_ipc::Instance, output: &str) -> Result<Borr
         output,
         "moved workspaces onto the session output"
     );
-    Ok(Borrowed { homes, shown })
+    Ok(Borrowed {
+        _lease: lease,
+        output: output.into(),
+        homes,
+        shown,
+    })
 }
 
 /// Undo `borrow_workspaces`: each workspace to its monitor, if that is
@@ -1574,13 +1615,22 @@ fn return_workspaces(instance: &hypr_ipc::Instance, borrowed: &Borrowed) {
         .monitors()
         .map(|mons| mons.into_iter().map(|m| m.name).collect())
         .unwrap_or_default();
+    let workspaces = instance.workspaces().unwrap_or_default();
+    let mut restored = std::collections::HashSet::new();
     for (id, home) in &borrowed.homes {
-        if present.contains(home) {
-            let _ = instance.move_workspace_to_monitor(*id, home);
+        // A user may have moved the workspace elsewhere during the session.
+        // Only restore workspaces this output still owns.
+        if present.contains(home)
+            && workspaces
+                .iter()
+                .any(|ws| ws.id == *id && ws.monitor == borrowed.output)
+            && instance.move_workspace_to_monitor(*id, home).is_ok()
+        {
+            restored.insert(*id);
         }
     }
     for (monitor, id) in &borrowed.shown {
-        if present.contains(monitor) {
+        if present.contains(monitor) && restored.contains(id) {
             let _ = instance.show_workspace(monitor, *id);
         }
     }
@@ -1659,6 +1709,7 @@ fn setup_output(
             scale: m.scale,
             headless: None,
             borrowed: None,
+            awake: None,
         });
     }
     let before: Vec<String> = instance.monitors()?.into_iter().map(|m| m.name).collect();
@@ -1674,6 +1725,7 @@ fn setup_output(
         scale: 1.0,
         headless: Some(instance.clone()),
         borrowed: None,
+        awake: None,
     };
     std::thread::sleep(Duration::from_millis(200));
     let after = instance.monitors()?;
@@ -1706,7 +1758,7 @@ fn setup_output(
     output.height = h & !1;
     output.scale = scale;
     // An output added while the remote sleeps comes up switched off.
-    output.keep_awake();
+    output.awake = Some(KeepAwake::start(instance.clone(), output.name.clone())?);
     if cfg.move_workspaces
         || caps
             .features
@@ -1800,6 +1852,38 @@ fn stream_limit(encoder: (u32, u32), caps: &ClientCaps) -> Result<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn workspaces_have_only_one_borrower_until_restoration_ends() {
+        let directory = tempfile::tempdir().unwrap();
+        let instance = hypr_ipc::Instance {
+            signature: "test".into(),
+            dir: directory.path().into(),
+        };
+        let first = workspace_lease(&instance).unwrap();
+        assert!(workspace_lease(&instance).is_err());
+        drop(first);
+        assert!(workspace_lease(&instance).is_ok());
+    }
+
+    #[test]
+    fn slow_dpms_ipc_does_not_block_the_streaming_runtime() {
+        let (started, ready) = std::sync::mpsc::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let poll = KeepAwake::poll(Duration::from_secs(60), move || {
+            started.send(()).unwrap();
+            blocked.recv().unwrap();
+        })
+        .unwrap();
+        ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async { tokio::time::sleep(Duration::from_millis(10)).await });
+        release.send(()).unwrap();
+        drop(poll);
+    }
+
     #[test]
     fn initial_stream_respects_client_limits_before_first_resize() {
         let caps = ClientCaps {

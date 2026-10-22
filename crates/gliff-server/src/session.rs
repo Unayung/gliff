@@ -255,9 +255,6 @@ where
         cursor_shape_id: 0,
     };
 
-    // How often a headless output is checked for having been switched off.
-    let mut awake = tokio::time::interval(Duration::from_secs(2));
-    awake.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         let flow = tokio::select! {
             msg = msg_rx.recv() => match msg {
@@ -312,10 +309,6 @@ where
             _ = tokio::time::sleep_until(tokio::time::Instant::from_std(session.refine_wake())),
                 if session.can_refine() =>
             {
-                ControlFlow::Continue(())
-            }
-            _ = awake.tick(), if session.output.is_headless() => {
-                session.output.keep_awake();
                 ControlFlow::Continue(())
             }
             // The pace timer: fires when a frame waits only on the cadence.
@@ -1457,6 +1450,53 @@ impl VideoEncoder {
     }
 }
 
+/// Blocking compositor IPC stays off the single-threaded streaming runtime.
+/// One worker per headless output also prevents overlapping slow polls.
+struct KeepAwake {
+    stop: std::sync::mpsc::Sender<()>,
+    task: Option<std::thread::JoinHandle<()>>,
+}
+
+impl KeepAwake {
+    fn start(instance: hypr_ipc::Instance, name: String) -> std::io::Result<Self> {
+        Self::poll(Duration::from_secs(2), move || match instance.monitors() {
+            Ok(mons) if mons.iter().any(|m| m.name == name && !m.dpms_status) => {
+                if let Err(e) = instance.set_dpms(&name, true) {
+                    tracing::warn!(error = %e, "could not switch the headless output on");
+                }
+            }
+            Ok(_) => {}
+            Err(e) => tracing::debug!(error = %e, "cannot read the output's DPMS state"),
+        })
+    }
+
+    fn poll(every: Duration, mut check: impl FnMut() + Send + 'static) -> std::io::Result<Self> {
+        use std::sync::mpsc::{channel, RecvTimeoutError};
+        let (stop, rx) = channel();
+        let task = std::thread::Builder::new()
+            .name("gliff-output-awake".into())
+            .spawn(move || loop {
+                check();
+                if !matches!(rx.recv_timeout(every), Err(RecvTimeoutError::Timeout)) {
+                    break;
+                }
+            })?;
+        Ok(Self {
+            stop,
+            task: Some(task),
+        })
+    }
+}
+
+impl Drop for KeepAwake {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(task) = self.task.take() {
+            let _ = task.join();
+        }
+    }
+}
+
 /// The output being served. A created headless output is removed on drop, on
 /// every exit path including a failure later in setup.
 struct SessionOutput {
@@ -1467,6 +1507,7 @@ struct SessionOutput {
     /// Output scale; the logical size the pointer works in is size / scale.
     scale: f32,
     headless: Option<hypr_ipc::Instance>,
+    awake: Option<KeepAwake>,
     /// Workspaces moved onto the headless output, to put back.
     borrowed: Option<Borrowed>,
 }
@@ -1487,30 +1528,6 @@ impl SessionOutput {
         self.headless.is_some()
     }
 
-    /// Switch a headless output back on when something switched it off, as
-    /// an idle daemon's `dpms off` does to every monitor before it locks.
-    /// Hyprland does not render an output with DPMS off, so the stream would
-    /// freeze on black, lock screen included. Only this output is touched:
-    /// the remote's own screens keep their state.
-    fn keep_awake(&self) {
-        let Some(instance) = &self.headless else {
-            return;
-        };
-        let off = match instance.monitors() {
-            Ok(mons) => mons.iter().any(|m| m.name == self.name && !m.dpms_status),
-            Err(e) => {
-                tracing::debug!(error = %e, "cannot read the output's DPMS state");
-                false
-            }
-        };
-        if off {
-            tracing::info!(output = %self.name, "headless output was switched off; switching it on");
-            if let Err(e) = instance.set_dpms(&self.name, true) {
-                tracing::warn!(error = %e, "could not switch the headless output on");
-            }
-        }
-    }
-
     /// The logical extent Hyprland exposes to clients and the virtual pointer.
     fn logical_extent(&self) -> InputCmd {
         let s = self.scale.max(0.5);
@@ -1523,6 +1540,7 @@ impl SessionOutput {
 
 impl Drop for SessionOutput {
     fn drop(&mut self) {
+        drop(self.awake.take());
         let Some(instance) = &self.headless else {
             return;
         };
@@ -1691,6 +1709,7 @@ fn setup_output(
             scale: m.scale,
             headless: None,
             borrowed: None,
+            awake: None,
         });
     }
     let before: Vec<String> = instance.monitors()?.into_iter().map(|m| m.name).collect();
@@ -1706,6 +1725,7 @@ fn setup_output(
         scale: 1.0,
         headless: Some(instance.clone()),
         borrowed: None,
+        awake: None,
     };
     std::thread::sleep(Duration::from_millis(200));
     let after = instance.monitors()?;
@@ -1738,7 +1758,7 @@ fn setup_output(
     output.height = h & !1;
     output.scale = scale;
     // An output added while the remote sleeps comes up switched off.
-    output.keep_awake();
+    output.awake = Some(KeepAwake::start(instance.clone(), output.name.clone())?);
     if cfg.move_workspaces {
         match borrow_workspaces(instance, &output.name) {
             Ok(borrowed) => output.borrowed = Some(borrowed),
@@ -1838,6 +1858,25 @@ mod tests {
         assert!(workspace_lease(&instance).is_err());
         drop(first);
         assert!(workspace_lease(&instance).is_ok());
+    }
+
+    #[test]
+    fn slow_dpms_ipc_does_not_block_the_streaming_runtime() {
+        let (started, ready) = std::sync::mpsc::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let poll = KeepAwake::poll(Duration::from_secs(60), move || {
+            started.send(()).unwrap();
+            blocked.recv().unwrap();
+        })
+        .unwrap();
+        ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async { tokio::time::sleep(Duration::from_millis(10)).await });
+        release.send(()).unwrap();
+        drop(poll);
     }
 
     #[test]

@@ -170,17 +170,17 @@ impl Instance {
     }
 
     /// Move a workspace, with its windows, onto `monitor`.
-    pub fn move_workspace_to_monitor(&self, workspace: i64, monitor: &str) -> Result<()> {
+    pub fn move_workspace_to_monitor(&self, workspace: &str, monitor: &str) -> Result<()> {
         self.dispatcher(
             &format!("moveworkspacetomonitor {workspace} {monitor}"),
             &format!(
-                "hl.dsp.workspace.move({{ workspace = {workspace}, monitor = \"{monitor}\" }})"
+                "hl.dsp.workspace.move({{ workspace = \"{workspace}\", monitor = \"{monitor}\" }})"
             ),
         )
     }
 
     /// Show `workspace` on `monitor`, which it must be on, and focus it.
-    pub fn show_workspace(&self, monitor: &str, workspace: i64) -> Result<()> {
+    pub fn show_workspace(&self, monitor: &str, workspace: &str) -> Result<()> {
         self.dispatcher(
             &format!("focusmonitor {monitor}"),
             &format!("hl.dsp.focus({{ monitor = \"{monitor}\" }})"),
@@ -297,9 +297,15 @@ pub struct WorkspaceRef {
     pub name: String,
 }
 
+impl WorkspaceRef {
+    pub fn selector(&self) -> String {
+        workspace_selector(self.id, &self.name)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Workspace {
-    /// Negative for special (scratchpad) workspaces.
+    /// Negative for named and special (scratchpad) workspaces.
     pub id: i64,
     #[serde(default)]
     pub name: String,
@@ -307,6 +313,28 @@ pub struct Workspace {
     pub monitor: String,
     #[serde(default)]
     pub windows: u32,
+}
+
+impl Workspace {
+    /// A scratchpad. Named workspaces have negative IDs too, so only the
+    /// name tells them apart.
+    pub fn is_special(&self) -> bool {
+        self.name.starts_with("special")
+    }
+
+    pub fn selector(&self) -> String {
+        workspace_selector(self.id, &self.name)
+    }
+}
+
+/// How dispatchers address a workspace: by ID, or by name when it is named
+/// and its ID is negative.
+pub fn workspace_selector(id: i64, name: &str) -> String {
+    if id > 0 {
+        id.to_string()
+    } else {
+        format!("name:{name}")
+    }
 }
 
 fn one() -> f32 {
@@ -366,11 +394,71 @@ mod tests {
         assert!(Instance::discover_in(tmp.path(), Some("missing")).is_err());
     }
 
+    /// Run `call` against a socket that answers each connection with the next
+    /// of `responses`, and return what it got back and the commands sent.
+    fn against_socket(
+        responses: &'static [&'static str],
+        call: impl FnOnce(&Instance) -> Result<()>,
+    ) -> (Result<()>, Vec<String>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let inst = Instance {
+            signature: "test".into(),
+            dir: tmp.path().to_path_buf(),
+        };
+        let listener = std::os::unix::net::UnixListener::bind(inst.socket_path()).unwrap();
+        let mut responses = responses.iter().copied();
+        let server = std::thread::spawn(move || {
+            let mut commands = Vec::new();
+            loop {
+                let (mut conn, _) = listener.accept().unwrap();
+                let mut buf = [0; 512];
+                let n = conn.read(&mut buf).unwrap();
+                // An empty connection is the test hanging up.
+                if n == 0 {
+                    return commands;
+                }
+                commands.push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                conn.write_all(responses.next().unwrap_or("unexpected").as_bytes())
+                    .unwrap();
+            }
+        });
+        let result = call(&inst);
+        drop(UnixStream::connect(inst.socket_path()).unwrap());
+        (result, server.join().unwrap())
+    }
+
+    #[test]
+    fn set_dpms_falls_back_to_lua_only_when_asked() {
+        let (result, commands) = against_socket(&["ok"], |i| i.set_dpms("gliff-7", false));
+        assert!(result.is_ok());
+        assert_eq!(commands, ["dispatch dpms off gliff-7"]);
+
+        // What a Lua config answers the legacy form with.
+        const LUA: &str = "error: [string \"return hl.dispatch(dpms on gliff-7)...\"]:1: ')' expected near 'on'\n\n \u{2192} Note: dispatch in lua is a shorthand for hl.dispatch(...), your syntax might need to be updated.";
+        let (result, commands) = against_socket(&[LUA, "ok"], |i| i.set_dpms("gliff-7", true));
+        assert!(result.is_ok());
+        assert_eq!(
+            commands,
+            [
+                "dispatch dpms on gliff-7",
+                r#"dispatch hl.dsp.dpms({ action = "on", monitor = "gliff-7" })"#,
+            ]
+        );
+
+        let (result, commands) =
+            against_socket(&["monitor not found"], |i| i.set_dpms("gliff-7", true));
+        assert!(
+            matches!(result, Err(Error::Command { response, .. }) if response == "monitor not found")
+        );
+        assert_eq!(commands, ["dispatch dpms on gliff-7"]);
+    }
+
     #[test]
     fn parses_workspaces_and_active_workspace() {
         let ws: Vec<Workspace> = serde_json::from_str(
             r#"[{"id": 1, "name": "1", "monitor": "DP-2", "monitorID": 0, "windows": 3},
-                {"id": -98, "name": "special:scratch", "monitor": "DP-2", "windows": 0}]"#,
+                {"id": -98, "name": "special:scratch", "monitor": "DP-2", "windows": 0},
+                {"id": -1337, "name": "mail", "monitor": "DP-2", "windows": 1}]"#,
         )
         .unwrap();
         assert_eq!(
@@ -378,6 +466,10 @@ mod tests {
             (1, "DP-2", 3)
         );
         assert_eq!(ws[1].id, -98);
+        assert!(ws[1].is_special());
+        assert!(!ws[0].is_special() && !ws[2].is_special());
+        assert_eq!(ws[0].selector(), "1");
+        assert_eq!(ws[2].selector(), "name:mail");
         let m: Monitor = serde_json::from_str(
             r#"{"id": 0, "name": "DP-2", "width": 3440, "height": 1440,
                 "activeWorkspace": {"id": 4, "name": "4"}}"#,

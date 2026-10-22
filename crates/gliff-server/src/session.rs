@@ -1517,10 +1517,10 @@ struct Borrowed {
     /// Held for the full borrow/restore lifetime, across every server process.
     _lease: std::fs::File,
     output: String,
-    /// Each moved workspace and the monitor it came from.
-    homes: Vec<(i64, String)>,
+    /// Each moved workspace's selector and the monitor it came from.
+    homes: Vec<(String, String)>,
     /// The workspace each other monitor was showing.
-    shown: Vec<(String, i64)>,
+    shown: Vec<(String, String)>,
 }
 
 impl SessionOutput {
@@ -1572,27 +1572,30 @@ fn workspace_lease(instance: &hypr_ipc::Instance) -> Result<std::fs::File> {
 fn borrow_workspaces(instance: &hypr_ipc::Instance, output: &str) -> Result<Borrowed> {
     let lease = workspace_lease(instance)?;
     let mons = instance.monitors()?;
-    let shown: Vec<(String, i64)> = mons
+    let shown: Vec<(String, String)> = mons
         .iter()
-        .filter(|m| m.name != output && !m.disabled && m.active_workspace.id > 0)
-        .map(|m| (m.name.clone(), m.active_workspace.id))
+        .filter(|m| m.name != output && !m.disabled && m.active_workspace.id != 0)
+        .map(|m| (m.name.clone(), m.active_workspace.selector()))
         .collect();
     let front = main_monitor(&mons)
         .filter(|m| m.name != output)
-        .map(|m| m.active_workspace.id);
+        .map(|m| m.active_workspace.selector());
     let mut homes = Vec::new();
     for ws in instance.workspaces()? {
-        if ws.id <= 0 || ws.monitor == output || ws.monitor.starts_with("gliff-") {
+        if ws.is_special() || ws.monitor == output || ws.monitor.starts_with("gliff-") {
             continue;
         }
-        match instance.move_workspace_to_monitor(ws.id, output) {
-            Ok(()) => homes.push((ws.id, ws.monitor)),
-            Err(e) => tracing::warn!(workspace = ws.id, error = %e, "could not move workspace"),
+        let selector = ws.selector();
+        // Record the home first: a move whose answer times out may still
+        // happen. Restoration only moves what is on this output.
+        homes.push((selector.clone(), ws.monitor));
+        if let Err(e) = instance.move_workspace_to_monitor(&selector, output) {
+            tracing::warn!(workspace = selector, error = %e, "could not move workspace");
         }
     }
-    if let Some(id) = front.filter(|id| homes.iter().any(|(w, _)| w == id)) {
-        if let Err(e) = instance.show_workspace(output, id) {
-            tracing::warn!(workspace = id, error = %e, "could not show workspace");
+    if let Some(ws) = front.filter(|ws| homes.iter().any(|(w, _)| w == ws)) {
+        if let Err(e) = instance.show_workspace(output, &ws) {
+            tracing::warn!(workspace = ws, error = %e, "could not show workspace");
         }
     }
     tracing::info!(
@@ -1635,21 +1638,21 @@ fn return_workspaces(instance: &hypr_ipc::Instance, borrowed: &Borrowed) {
         };
     let present: Vec<String> = monitors.into_iter().map(|m| m.name).collect();
     let mut restored = std::collections::HashSet::new();
-    for (id, home) in &borrowed.homes {
+    for (ws, home) in &borrowed.homes {
         // A user may have moved the workspace elsewhere during the session.
         // Only restore workspaces this output still owns.
         if present.contains(home)
             && workspaces
                 .iter()
-                .any(|ws| ws.id == *id && ws.monitor == borrowed.output)
-            && instance.move_workspace_to_monitor(*id, home).is_ok()
+                .any(|w| w.selector() == *ws && w.monitor == borrowed.output)
+            && instance.move_workspace_to_monitor(ws, home).is_ok()
         {
-            restored.insert(*id);
+            restored.insert(ws);
         }
     }
-    for (monitor, id) in &borrowed.shown {
-        if present.contains(monitor) && restored.contains(id) {
-            let _ = instance.show_workspace(monitor, *id);
+    for (monitor, ws) in &borrowed.shown {
+        if present.contains(monitor) && restored.contains(ws) {
+            let _ = instance.show_workspace(monitor, ws);
         }
     }
 }
@@ -1731,11 +1734,11 @@ fn setup_output(
         });
     }
     let requested = format!("gliff-{}", std::process::id());
-    let wait = match instance.create_headless_output(&requested) {
-        Ok(()) => Duration::from_secs(1),
+    let (wait, timed_out) = match instance.create_headless_output(&requested) {
+        Ok(()) => (Duration::from_secs(1), None),
         Err(e) if creation_may_complete(&e) => {
             tracing::warn!(error = %e, "headless request timed out; waiting for its named output");
-            Duration::from_secs(10)
+            (Duration::from_secs(10), Some(e))
         }
         Err(e) => return Err(e).context("create headless output"),
     };
@@ -1754,6 +1757,13 @@ fn setup_output(
         instance
             .monitors()
             .map(|mons| mons.into_iter().map(|m| m.name).collect())
+    })
+    .map_err(|e| match timed_out {
+        // Report why the output was waited for, not only that it never came.
+        Some(cause) => anyhow::Error::new(cause)
+            .context("create headless output")
+            .context(e),
+        None => e,
     })?;
     let width = caps.max_width.clamp(320, 1920) & !1;
     let height = caps.max_height.clamp(240, 1080) & !1;

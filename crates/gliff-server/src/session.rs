@@ -1611,14 +1611,15 @@ fn borrow_workspaces(instance: &hypr_ipc::Instance, output: &str) -> Result<Borr
     })
 }
 
-/// A modeset can temporarily stall IPC. Retry before giving up ownership
-/// checks; treating a failed query as an empty desktop silently skips every
-/// restoration, while blindly restoring would undo the user's own moves.
-fn retry_workspace_snapshot<T>(mut read: impl FnMut() -> Result<T>) -> Result<T> {
+/// A modeset can temporarily stall IPC. Retry each restoration request
+/// before giving up: treating a failed query as an empty desktop silently
+/// skips every restoration, blindly restoring would undo the user's own
+/// moves, and a failed move strands the workspace once the output goes.
+fn retry_restoration<T>(mut read: impl FnMut() -> Result<T>) -> Result<T> {
     for _ in 0..2 {
         match read() {
             Ok(snapshot) => return Ok(snapshot),
-            Err(e) => tracing::debug!(error = %e, "retrying workspace restoration snapshot"),
+            Err(e) => tracing::debug!(error = %e, "retrying workspace restoration"),
         }
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -1629,7 +1630,7 @@ fn retry_workspace_snapshot<T>(mut read: impl FnMut() -> Result<T>) -> Result<T>
 /// still there, and each monitor back to what it showed.
 fn return_workspaces(instance: &hypr_ipc::Instance, borrowed: &Borrowed) {
     let (monitors, workspaces) =
-        match retry_workspace_snapshot(|| Ok((instance.monitors()?, instance.workspaces()?))) {
+        match retry_restoration(|| Ok((instance.monitors()?, instance.workspaces()?))) {
             Ok(snapshot) => snapshot,
             Err(e) => {
                 tracing::warn!(error = %e, "cannot read workspace ownership for restoration");
@@ -1641,13 +1642,20 @@ fn return_workspaces(instance: &hypr_ipc::Instance, borrowed: &Borrowed) {
     for (ws, home) in &borrowed.homes {
         // A user may have moved the workspace elsewhere during the session.
         // Only restore workspaces this output still owns.
-        if present.contains(home)
-            && workspaces
+        if !present.contains(home)
+            || !workspaces
                 .iter()
                 .any(|w| w.selector() == *ws && w.monitor == borrowed.output)
-            && instance.move_workspace_to_monitor(ws, home).is_ok()
         {
-            restored.insert(ws);
+            continue;
+        }
+        match retry_restoration(|| Ok(instance.move_workspace_to_monitor(ws, home)?)) {
+            Ok(()) => {
+                restored.insert(ws);
+            }
+            Err(e) => {
+                tracing::warn!(workspace = ws, home, error = %e, "could not return workspace")
+            }
         }
     }
     for (monitor, ws) in &borrowed.shown {
@@ -1913,7 +1921,7 @@ mod tests {
     #[test]
     fn restoration_retries_transient_ipc_failures_and_reports_persistent_ones() {
         let mut calls = 0;
-        let snapshot = retry_workspace_snapshot(|| {
+        let snapshot = retry_restoration(|| {
             calls += 1;
             anyhow::ensure!(calls > 1, "temporary IPC timeout");
             Ok(vec![7])
@@ -1922,7 +1930,7 @@ mod tests {
         assert_eq!(snapshot, vec![7]);
         assert_eq!(calls, 2);
         let mut calls = 0;
-        let result: Result<()> = retry_workspace_snapshot(|| {
+        let result: Result<()> = retry_restoration(|| {
             calls += 1;
             anyhow::bail!("compositor is unavailable")
         });

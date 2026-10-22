@@ -1517,10 +1517,10 @@ struct Borrowed {
     /// Held for the full borrow/restore lifetime, across every server process.
     _lease: std::fs::File,
     output: String,
-    /// Each moved workspace and the monitor it came from.
-    homes: Vec<(i64, String)>,
+    /// Each moved workspace's selector and the monitor it came from.
+    homes: Vec<(String, String)>,
     /// The workspace each other monitor was showing.
-    shown: Vec<(String, i64)>,
+    shown: Vec<(String, String)>,
 }
 
 impl SessionOutput {
@@ -1572,27 +1572,30 @@ fn workspace_lease(instance: &hypr_ipc::Instance) -> Result<std::fs::File> {
 fn borrow_workspaces(instance: &hypr_ipc::Instance, output: &str) -> Result<Borrowed> {
     let lease = workspace_lease(instance)?;
     let mons = instance.monitors()?;
-    let shown: Vec<(String, i64)> = mons
+    let shown: Vec<(String, String)> = mons
         .iter()
-        .filter(|m| m.name != output && !m.disabled && m.active_workspace.id > 0)
-        .map(|m| (m.name.clone(), m.active_workspace.id))
+        .filter(|m| m.name != output && !m.disabled && m.active_workspace.id != 0)
+        .map(|m| (m.name.clone(), m.active_workspace.selector()))
         .collect();
     let front = main_monitor(&mons)
         .filter(|m| m.name != output)
-        .map(|m| m.active_workspace.id);
+        .map(|m| m.active_workspace.selector());
     let mut homes = Vec::new();
     for ws in instance.workspaces()? {
-        if ws.id <= 0 || ws.monitor == output || ws.monitor.starts_with("gliff-") {
+        if ws.is_special() || ws.monitor == output || ws.monitor.starts_with("gliff-") {
             continue;
         }
-        match instance.move_workspace_to_monitor(ws.id, output) {
-            Ok(()) => homes.push((ws.id, ws.monitor)),
-            Err(e) => tracing::warn!(workspace = ws.id, error = %e, "could not move workspace"),
+        let selector = ws.selector();
+        // Record the home first: a move whose answer times out may still
+        // happen. Restoration only moves what is on this output.
+        homes.push((selector.clone(), ws.monitor));
+        if let Err(e) = instance.move_workspace_to_monitor(&selector, output) {
+            tracing::warn!(workspace = selector, error = %e, "could not move workspace");
         }
     }
-    if let Some(id) = front.filter(|id| homes.iter().any(|(w, _)| w == id)) {
-        if let Err(e) = instance.show_workspace(output, id) {
-            tracing::warn!(workspace = id, error = %e, "could not show workspace");
+    if let Some(ws) = front.filter(|ws| homes.iter().any(|(w, _)| w == ws)) {
+        if let Err(e) = instance.show_workspace(output, &ws) {
+            tracing::warn!(workspace = ws, error = %e, "could not show workspace");
         }
     }
     tracing::info!(
@@ -1635,21 +1638,21 @@ fn return_workspaces(instance: &hypr_ipc::Instance, borrowed: &Borrowed) {
         };
     let present: Vec<String> = monitors.into_iter().map(|m| m.name).collect();
     let mut restored = std::collections::HashSet::new();
-    for (id, home) in &borrowed.homes {
+    for (ws, home) in &borrowed.homes {
         // A user may have moved the workspace elsewhere during the session.
         // Only restore workspaces this output still owns.
         if present.contains(home)
             && workspaces
                 .iter()
-                .any(|ws| ws.id == *id && ws.monitor == borrowed.output)
-            && instance.move_workspace_to_monitor(*id, home).is_ok()
+                .any(|w| w.selector() == *ws && w.monitor == borrowed.output)
+            && instance.move_workspace_to_monitor(ws, home).is_ok()
         {
-            restored.insert(*id);
+            restored.insert(ws);
         }
     }
-    for (monitor, id) in &borrowed.shown {
-        if present.contains(monitor) && restored.contains(id) {
-            let _ = instance.show_workspace(monitor, *id);
+    for (monitor, ws) in &borrowed.shown {
+        if present.contains(monitor) && restored.contains(ws) {
+            let _ = instance.show_workspace(monitor, ws);
         }
     }
 }

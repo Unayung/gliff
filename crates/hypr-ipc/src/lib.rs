@@ -170,17 +170,17 @@ impl Instance {
     }
 
     /// Move a workspace, with its windows, onto `monitor`.
-    pub fn move_workspace_to_monitor(&self, workspace: i64, monitor: &str) -> Result<()> {
+    pub fn move_workspace_to_monitor(&self, workspace: &str, monitor: &str) -> Result<()> {
         self.dispatcher(
             &format!("moveworkspacetomonitor {workspace} {monitor}"),
             &format!(
-                "hl.dsp.workspace.move({{ workspace = {workspace}, monitor = \"{monitor}\" }})"
+                "hl.dsp.workspace.move({{ workspace = \"{workspace}\", monitor = \"{monitor}\" }})"
             ),
         )
     }
 
     /// Show `workspace` on `monitor`, which it must be on, and focus it.
-    pub fn show_workspace(&self, monitor: &str, workspace: i64) -> Result<()> {
+    pub fn show_workspace(&self, monitor: &str, workspace: &str) -> Result<()> {
         self.dispatcher(
             &format!("focusmonitor {monitor}"),
             &format!("hl.dsp.focus({{ monitor = \"{monitor}\" }})"),
@@ -297,9 +297,15 @@ pub struct WorkspaceRef {
     pub name: String,
 }
 
+impl WorkspaceRef {
+    pub fn selector(&self) -> String {
+        workspace_selector(self.id, &self.name)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Workspace {
-    /// Negative for special (scratchpad) workspaces.
+    /// Negative for named and special (scratchpad) workspaces.
     pub id: i64,
     #[serde(default)]
     pub name: String,
@@ -307,6 +313,28 @@ pub struct Workspace {
     pub monitor: String,
     #[serde(default)]
     pub windows: u32,
+}
+
+impl Workspace {
+    /// A scratchpad. Named workspaces have negative IDs too, so only the
+    /// name tells them apart.
+    pub fn is_special(&self) -> bool {
+        self.name.starts_with("special")
+    }
+
+    pub fn selector(&self) -> String {
+        workspace_selector(self.id, &self.name)
+    }
+}
+
+/// How dispatchers address a workspace: by ID, or by name when it is named
+/// and its ID is negative.
+pub fn workspace_selector(id: i64, name: &str) -> String {
+    if id > 0 {
+        id.to_string()
+    } else {
+        format!("name:{name}")
+    }
 }
 
 fn one() -> f32 {
@@ -429,7 +457,8 @@ mod tests {
     fn parses_workspaces_and_active_workspace() {
         let ws: Vec<Workspace> = serde_json::from_str(
             r#"[{"id": 1, "name": "1", "monitor": "DP-2", "monitorID": 0, "windows": 3},
-                {"id": -98, "name": "special:scratch", "monitor": "DP-2", "windows": 0}]"#,
+                {"id": -98, "name": "special:scratch", "monitor": "DP-2", "windows": 0},
+                {"id": -1337, "name": "mail", "monitor": "DP-2", "windows": 1}]"#,
         )
         .unwrap();
         assert_eq!(
@@ -437,6 +466,10 @@ mod tests {
             (1, "DP-2", 3)
         );
         assert_eq!(ws[1].id, -98);
+        assert!(ws[1].is_special());
+        assert!(!ws[0].is_special() && !ws[2].is_special());
+        assert_eq!(ws[0].selector(), "1");
+        assert_eq!(ws[2].selector(), "name:mail");
         let m: Monitor = serde_json::from_str(
             r#"{"id": 0, "name": "DP-2", "width": 3440, "height": 1440,
                 "activeWorkspace": {"id": 4, "name": "4"}}"#,

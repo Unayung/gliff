@@ -1608,14 +1608,32 @@ fn borrow_workspaces(instance: &hypr_ipc::Instance, output: &str) -> Result<Borr
     })
 }
 
+/// A modeset can temporarily stall IPC. Retry before giving up ownership
+/// checks; treating a failed query as an empty desktop silently skips every
+/// restoration, while blindly restoring would undo the user's own moves.
+fn retry_workspace_snapshot<T>(mut read: impl FnMut() -> Result<T>) -> Result<T> {
+    for _ in 0..2 {
+        match read() {
+            Ok(snapshot) => return Ok(snapshot),
+            Err(e) => tracing::debug!(error = %e, "retrying workspace restoration snapshot"),
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    read()
+}
+
 /// Undo `borrow_workspaces`: each workspace to its monitor, if that is
 /// still there, and each monitor back to what it showed.
 fn return_workspaces(instance: &hypr_ipc::Instance, borrowed: &Borrowed) {
-    let present: Vec<String> = instance
-        .monitors()
-        .map(|mons| mons.into_iter().map(|m| m.name).collect())
-        .unwrap_or_default();
-    let workspaces = instance.workspaces().unwrap_or_default();
+    let (monitors, workspaces) =
+        match retry_workspace_snapshot(|| Ok((instance.monitors()?, instance.workspaces()?))) {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot read workspace ownership for restoration");
+                return;
+            }
+        };
+    let present: Vec<String> = monitors.into_iter().map(|m| m.name).collect();
     let mut restored = std::collections::HashSet::new();
     for (id, home) in &borrowed.homes {
         // A user may have moved the workspace elsewhere during the session.
@@ -1877,6 +1895,26 @@ fn stream_limit(encoder: (u32, u32), caps: &ClientCaps) -> Result<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn restoration_retries_transient_ipc_failures_and_reports_persistent_ones() {
+        let mut calls = 0;
+        let snapshot = retry_workspace_snapshot(|| {
+            calls += 1;
+            anyhow::ensure!(calls > 1, "temporary IPC timeout");
+            Ok(vec![7])
+        })
+        .unwrap();
+        assert_eq!(snapshot, vec![7]);
+        assert_eq!(calls, 2);
+        let mut calls = 0;
+        let result: Result<()> = retry_workspace_snapshot(|| {
+            calls += 1;
+            anyhow::bail!("compositor is unavailable")
+        });
+        assert!(result.is_err());
+        assert_eq!(calls, 3);
+    }
+
     #[test]
     fn workspaces_have_only_one_borrower_until_restoration_ends() {
         let directory = tempfile::tempdir().unwrap();

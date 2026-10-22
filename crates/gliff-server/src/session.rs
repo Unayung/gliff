@@ -1473,6 +1473,9 @@ struct SessionOutput {
 
 /// Where the workspaces were before a session moved them onto its output.
 struct Borrowed {
+    /// Held for the full borrow/restore lifetime, across every server process.
+    _lease: std::fs::File,
+    output: String,
     /// Each moved workspace and the monitor it came from.
     homes: Vec<(i64, String)>,
     /// The workspace each other monitor was showing.
@@ -1532,9 +1535,24 @@ impl Drop for SessionOutput {
     }
 }
 
+/// A compositor has one set of workspaces. Keep a compositor-wide lease so
+/// another remote client cannot borrow them again or undo our restoration.
+fn workspace_lease(instance: &hypr_ipc::Instance) -> Result<std::fs::File> {
+    let lease = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(instance.dir.join("gliff-workspaces.lock"))?;
+    rustix::fs::flock(&lease, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+        .context("another gliff session already holds the remote workspaces")?;
+    Ok(lease)
+}
+
 /// Move every regular workspace onto `output` and show there the one the
 /// main monitor was showing, recording where each came from.
 fn borrow_workspaces(instance: &hypr_ipc::Instance, output: &str) -> Result<Borrowed> {
+    let lease = workspace_lease(instance)?;
     let mons = instance.monitors()?;
     let shown: Vec<(String, i64)> = mons
         .iter()
@@ -1546,7 +1564,7 @@ fn borrow_workspaces(instance: &hypr_ipc::Instance, output: &str) -> Result<Borr
         .map(|m| m.active_workspace.id);
     let mut homes = Vec::new();
     for ws in instance.workspaces()? {
-        if ws.id <= 0 || ws.monitor == output {
+        if ws.id <= 0 || ws.monitor == output || ws.monitor.starts_with("gliff-") {
             continue;
         }
         match instance.move_workspace_to_monitor(ws.id, output) {
@@ -1564,7 +1582,12 @@ fn borrow_workspaces(instance: &hypr_ipc::Instance, output: &str) -> Result<Borr
         output,
         "moved workspaces onto the session output"
     );
-    Ok(Borrowed { homes, shown })
+    Ok(Borrowed {
+        _lease: lease,
+        output: output.into(),
+        homes,
+        shown,
+    })
 }
 
 /// Undo `borrow_workspaces`: each workspace to its monitor, if that is
@@ -1574,13 +1597,22 @@ fn return_workspaces(instance: &hypr_ipc::Instance, borrowed: &Borrowed) {
         .monitors()
         .map(|mons| mons.into_iter().map(|m| m.name).collect())
         .unwrap_or_default();
+    let workspaces = instance.workspaces().unwrap_or_default();
+    let mut restored = std::collections::HashSet::new();
     for (id, home) in &borrowed.homes {
-        if present.contains(home) {
-            let _ = instance.move_workspace_to_monitor(*id, home);
+        // A user may have moved the workspace elsewhere during the session.
+        // Only restore workspaces this output still owns.
+        if present.contains(home)
+            && workspaces
+                .iter()
+                .any(|ws| ws.id == *id && ws.monitor == borrowed.output)
+            && instance.move_workspace_to_monitor(*id, home).is_ok()
+        {
+            restored.insert(*id);
         }
     }
     for (monitor, id) in &borrowed.shown {
-        if present.contains(monitor) {
+        if present.contains(monitor) && restored.contains(id) {
             let _ = instance.show_workspace(monitor, *id);
         }
     }
@@ -1795,6 +1827,19 @@ fn stream_limit(encoder: (u32, u32), caps: &ClientCaps) -> Result<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn workspaces_have_only_one_borrower_until_restoration_ends() {
+        let directory = tempfile::tempdir().unwrap();
+        let instance = hypr_ipc::Instance {
+            signature: "test".into(),
+            dir: directory.path().into(),
+        };
+        let first = workspace_lease(&instance).unwrap();
+        assert!(workspace_lease(&instance).is_err());
+        drop(first);
+        assert!(workspace_lease(&instance).is_ok());
+    }
+
     #[test]
     fn initial_stream_respects_client_limits_before_first_resize() {
         let caps = ClientCaps {

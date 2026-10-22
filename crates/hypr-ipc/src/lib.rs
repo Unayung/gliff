@@ -174,7 +174,8 @@ impl Instance {
         self.dispatcher(
             &format!("moveworkspacetomonitor {workspace} {monitor}"),
             &format!(
-                "hl.dsp.workspace.move({{ workspace = \"{workspace}\", monitor = \"{monitor}\" }})"
+                "hl.dsp.workspace.move({{ workspace = {}, monitor = \"{monitor}\" }})",
+                lua_str(workspace)
             ),
         )
     }
@@ -187,7 +188,7 @@ impl Instance {
         )?;
         self.dispatcher(
             &format!("workspace {workspace}"),
-            &format!("hl.dsp.focus({{ workspace = \"{workspace}\" }})"),
+            &format!("hl.dsp.focus({{ workspace = {} }})", lua_str(workspace)),
         )
     }
 
@@ -233,6 +234,13 @@ impl Instance {
             other => other,
         }
     }
+}
+
+/// `s` as a quoted Lua string. A workspace name can hold quotes and
+/// backslashes.
+// ponytail: Rust's string escapes (\", \\, \n, \u{..}) are all valid in Lua 5.3+.
+fn lua_str(s: &str) -> String {
+    format!("{s:?}")
 }
 
 /// Round a mode down until `scale` divides it into whole logical pixels.
@@ -451,6 +459,19 @@ mod tests {
             matches!(result, Err(Error::Command { response, .. }) if response == "monitor not found")
         );
         assert_eq!(commands, ["dispatch dpms on gliff-7"]);
+    }
+
+    #[test]
+    fn quotes_workspace_names_for_lua() {
+        const LUA: &str = "error: dispatch in lua is a shorthand for hl.dispatch(...)";
+        let (result, commands) = against_socket(&[LUA, "ok"], |i| {
+            i.move_workspace_to_monitor(r#"name:notes"2026\x"#, "gliff-7")
+        });
+        assert!(result.is_ok());
+        assert_eq!(
+            commands[1],
+            r#"dispatch hl.dsp.workspace.move({ workspace = "name:notes\"2026\\x", monitor = "gliff-7" })"#
+        );
     }
 
     #[test]

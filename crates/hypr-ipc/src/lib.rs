@@ -344,7 +344,9 @@ impl Workspace {
     /// A scratchpad. Named workspaces have negative IDs too, so only the
     /// name tells them apart.
     pub fn is_special(&self) -> bool {
-        self.name.starts_with("special")
+        // Hyprland names every special workspace `special:<name>`; a regular
+        // named workspace may still start with "special".
+        self.name.starts_with("special:")
     }
 
     pub fn selector(&self) -> String {
@@ -513,7 +515,7 @@ mod tests {
         let ws: Vec<Workspace> = serde_json::from_str(
             r#"[{"id": 1, "name": "1", "monitor": "DP-2", "monitorID": 0, "windows": 3},
                 {"id": -98, "name": "special:scratch", "monitor": "DP-2", "windows": 0},
-                {"id": -1337, "name": "mail", "monitor": "DP-2", "windows": 1}]"#,
+                {"id": -1337, "name": "special-mail", "monitor": "DP-2", "windows": 1}]"#,
         )
         .unwrap();
         assert_eq!(
@@ -524,7 +526,7 @@ mod tests {
         assert!(ws[1].is_special());
         assert!(!ws[0].is_special() && !ws[2].is_special());
         assert_eq!(ws[0].selector(), "1");
-        assert_eq!(ws[2].selector(), "name:mail");
+        assert_eq!(ws[2].selector(), "name:special-mail");
         let m: Monitor = serde_json::from_str(
             r#"{"id": 0, "name": "DP-2", "width": 3440, "height": 1440,
                 "activeWorkspace": {"id": 4, "name": "4"}}"#,

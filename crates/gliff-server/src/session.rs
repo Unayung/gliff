@@ -1742,7 +1742,9 @@ fn return_workspaces(instance: &hypr_ipc::Instance, borrowed: &Borrowed) {
     }
     for (monitor, ws) in &borrowed.shown {
         if present.contains(monitor) && restored.contains(ws) {
-            let _ = instance.show_workspace(monitor, ws);
+            if let Err(e) = retry_restoration(|| Ok(instance.show_workspace(monitor, ws)?)) {
+                tracing::warn!(monitor, workspace = ws, error = %e, "could not show restored workspace");
+            }
         }
     }
 }

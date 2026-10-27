@@ -160,10 +160,17 @@ impl Instance {
     /// Run a dispatcher. A legacy (hyprlang) config takes `dispatch <name>
     /// <args>`; a Lua config reads `dispatch` as `hl.dispatch(...)`, rejects
     /// that form, and takes the `hl.dsp` call in `lua` instead.
-    fn dispatcher(&self, legacy: &str, lua: &str) -> Result<()> {
+    fn dispatcher(&self, legacy: &str, lua: &str, allowed: impl Fn() -> bool) -> Result<()> {
+        if !allowed() {
+            return Ok(());
+        }
         match self.dispatch(&format!("dispatch {legacy}")) {
             Err(Error::Command { response, .. }) if response.contains("lua") => {
-                self.dispatch(&format!("dispatch {lua}"))
+                if allowed() {
+                    self.dispatch(&format!("dispatch {lua}"))
+                } else {
+                    Ok(())
+                }
             }
             other => other,
         }
@@ -177,6 +184,7 @@ impl Instance {
                 "hl.dsp.workspace.move({{ workspace = {}, monitor = \"{monitor}\" }})",
                 lua_str(workspace)
             ),
+            || true,
         )
     }
 
@@ -185,19 +193,28 @@ impl Instance {
         self.dispatcher(
             &format!("focusmonitor {monitor}"),
             &format!("hl.dsp.focus({{ monitor = \"{monitor}\" }})"),
+            || true,
         )?;
         self.dispatcher(
             &format!("workspace {workspace}"),
             &format!("hl.dsp.focus({{ workspace = {} }})", lua_str(workspace)),
+            || true,
         )
     }
 
     /// Switch one monitor's DPMS on or off, leaving the others alone.
     pub fn set_dpms(&self, monitor: &str, on: bool) -> Result<()> {
+        self.set_dpms_if(monitor, on, || true)
+    }
+
+    /// Like `set_dpms`, but check cancellation before starting either IPC
+    /// request. Teardown need only wait for an already-running request.
+    pub fn set_dpms_if(&self, monitor: &str, on: bool, allowed: impl Fn() -> bool) -> Result<()> {
         let action = if on { "on" } else { "off" };
         self.dispatcher(
             &format!("dpms {action} {monitor}"),
             &format!("hl.dsp.dpms({{ action = \"{action}\", monitor = \"{monitor}\" }})"),
+            allowed,
         )
     }
 
@@ -472,6 +489,23 @@ mod tests {
             commands[1],
             r#"dispatch hl.dsp.workspace.move({ workspace = "name:notes\"2026\\x", monitor = "gliff-7" })"#
         );
+    }
+
+    #[test]
+    fn cancelled_keep_awake_does_not_start_or_retry_ipc() {
+        let (result, commands) = against_socket(&[], |i| i.set_dpms_if("gliff-7", true, || false));
+        assert!(result.is_ok());
+        assert!(commands.is_empty());
+
+        let calls = std::cell::Cell::new(0);
+        let (result, commands) = against_socket(&["lua syntax error"], |i| {
+            i.set_dpms_if("gliff-7", true, || {
+                calls.set(calls.get() + 1);
+                calls.get() == 1
+            })
+        });
+        assert!(result.is_ok());
+        assert_eq!(commands, ["dispatch dpms on gliff-7"]);
     }
 
     #[test]

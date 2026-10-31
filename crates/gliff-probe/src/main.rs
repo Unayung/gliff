@@ -1505,7 +1505,7 @@ fn roundtrip(
             width,
             height,
         )?)),
-        VideoMode::Cpu => ProbeDecoder::Cpu(Box::new(gliff_sw::Decoder::new(dual)?)),
+        VideoMode::Cpu => ProbeDecoder::Cpu(Box::new(gliff_sw::Decoder::new(dual, width, height)?)),
     };
     let (w, h) = (width as usize, height as usize);
     let mut min_psnr = f64::MAX;
@@ -1649,7 +1649,7 @@ fn serve_decoder(
 ) -> Result<ProbeDecoder> {
     Ok(match gpu {
         Some(gpu) => ProbeDecoder::Gpu(Box::new(Decoder::new(gpu, dual, width, height)?)),
-        None => ProbeDecoder::Cpu(Box::new(gliff_sw::Decoder::new(dual)?)),
+        None => ProbeDecoder::Cpu(Box::new(gliff_sw::Decoder::new(dual, width, height)?)),
     })
 }
 
@@ -1812,7 +1812,9 @@ fn pipeline(
                 gliff_sw::Encoder::new(sw_settings(sw, sh, settings.bitrate), true)
                     .context("encoder")?,
             )),
-            ProbeDecoder::Cpu(Box::new(gliff_sw::Decoder::new(true).context("decoder")?)),
+            ProbeDecoder::Cpu(Box::new(
+                gliff_sw::Decoder::new(true, sw, sh).context("decoder")?,
+            )),
         ),
     };
     let t0 = std::time::Instant::now();

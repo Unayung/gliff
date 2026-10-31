@@ -804,7 +804,7 @@ dependencies = [
 
 [[package]]
 name = "gliff"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -832,7 +832,7 @@ dependencies = [
 
 [[package]]
 name = "gliff-audio"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "cpal",
@@ -842,7 +842,7 @@ dependencies = [
 
 [[package]]
 name = "gliff-mac"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "gliff-proto",
  "gliff-sw",
@@ -859,7 +859,7 @@ dependencies = [
 
 [[package]]
 name = "gliff-macos"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -877,7 +877,7 @@ dependencies = [
 
 [[package]]
 name = "gliff-probe"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -901,7 +901,7 @@ dependencies = [
 
 [[package]]
 name = "gliff-proto"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "minicbor",
  "proptest",
@@ -911,7 +911,7 @@ dependencies = [
 
 [[package]]
 name = "gliff-server"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -936,7 +936,7 @@ dependencies = [
 
 [[package]]
 name = "gliff-sw"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "gliff-proto",
  "openh264",
@@ -948,7 +948,7 @@ dependencies = [
 
 [[package]]
 name = "gliff-transport"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "bytes",
  "gliff-proto",
@@ -961,7 +961,7 @@ dependencies = [
 
 [[package]]
 name = "gliff-va"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "pkg-config",
  "thiserror 2.0.20",
@@ -970,7 +970,7 @@ dependencies = [
 
 [[package]]
 name = "gliff-vk"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "ash",
  "drm-fourcc",
@@ -1115,7 +1115,7 @@ checksum = "e17592d60ebacc7d5e169f4663c5f84f9161cc90328abcfe8456f41e4dfcb284"
 
 [[package]]
 name = "hypr-capture"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "calloop",
  "calloop-wayland-source",
@@ -1131,7 +1131,7 @@ dependencies = [
 
 [[package]]
 name = "hypr-input"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "calloop",
  "calloop-wayland-source",
@@ -1148,7 +1148,7 @@ dependencies = [
 
 [[package]]
 name = "hypr-ipc"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "rustix 1.1.4",
  "serde",
@@ -1160,7 +1160,7 @@ dependencies = [
 
 [[package]]
 name = "hypr-wl"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "calloop",
  "calloop-wayland-source",

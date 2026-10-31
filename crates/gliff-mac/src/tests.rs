@@ -65,7 +65,7 @@ fn run(dual: bool, w: u32, h: u32) {
         framerate: 60,
     };
     let mut enc = Encoder::new(settings, dual).expect("encoder");
-    let mut cpu = gliff_sw::Decoder::new(dual).expect("cpu decoder");
+    let mut cpu = gliff_sw::Decoder::new(dual, w, h).expect("cpu decoder");
     let mut dec = Decoder::new(&gpu, dual, w, h).expect("decoder");
     let (wu, hu) = (w as usize, h as usize);
     let mut frames = 0;

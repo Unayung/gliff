@@ -330,7 +330,9 @@ impl WorkspaceRef {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Workspace {
-    /// Negative for named and special (scratchpad) workspaces.
+    /// Negative for named and special (scratchpad) workspaces. Hyprland
+    /// 0.57 leaves it out for special ones.
+    #[serde(default)]
     pub id: i64,
     #[serde(default)]
     pub name: String,
@@ -527,6 +529,13 @@ mod tests {
         assert!(!ws[0].is_special() && !ws[2].is_special());
         assert_eq!(ws[0].selector(), "1");
         assert_eq!(ws[2].selector(), "name:special-mail");
+        // Hyprland 0.57 gives a special workspace no id.
+        let ws: Vec<Workspace> = serde_json::from_str(
+            r#"[{"address": "special:scratchpad", "type": "special",
+                 "name": "special:scratchpad", "monitor": "DP-2", "windows": 1}]"#,
+        )
+        .unwrap();
+        assert!(ws[0].is_special());
         let m: Monitor = serde_json::from_str(
             r#"{"id": 0, "name": "DP-2", "width": 3440, "height": 1440,
                 "activeWorkspace": {"id": 4, "name": "4"}}"#,

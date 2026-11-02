@@ -11,6 +11,8 @@ mod clipboard_ui;
 mod gpu;
 mod keycode;
 mod keymap;
+#[cfg(target_os = "macos")]
+mod macos_shortcuts;
 mod net;
 mod paintable;
 mod recent;
@@ -2211,6 +2213,8 @@ fn install_input_handlers(
         };
         focus.connect_enter(move |_| {
             tracing::debug!("video focused; inhibiting system shortcuts");
+            #[cfg(target_os = "macos")]
+            macos_shortcuts::capture(true);
             if let Some(toplevel) = window.surface().and_downcast::<gdk::Toplevel>() {
                 toplevel.inhibit_system_shortcuts(None::<&gdk::Event>);
             }
@@ -2226,6 +2230,8 @@ fn install_input_handlers(
         let ui = ui.clone();
         focus.connect_leave(move |_| {
             tracing::debug!("video unfocused; restoring system shortcuts");
+            #[cfg(target_os = "macos")]
+            macos_shortcuts::capture(false);
             release_pressed_keys(&ui);
             if let Some(toplevel) = window.surface().and_downcast::<gdk::Toplevel>() {
                 toplevel.restore_system_shortcuts();

@@ -39,3 +39,5 @@ hypr-input.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 gliff-mac.workspace = true
 gliff-macos.workspace = true
+objc2 = "0.6"
+objc2-foundation = "0.3"

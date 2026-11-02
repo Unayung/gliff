@@ -822,6 +822,8 @@ dependencies = [
  "hypr-input",
  "hypr-ipc",
  "libadwaita",
+ "objc2",
+ "objc2-foundation",
  "serde",
  "thiserror 2.0.20",
  "tokio",

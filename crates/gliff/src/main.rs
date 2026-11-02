@@ -12,6 +12,8 @@ mod gpu;
 mod keycode;
 mod keymap;
 #[cfg(target_os = "macos")]
+mod macos_fullscreen;
+#[cfg(target_os = "macos")]
 mod macos_shortcuts;
 mod net;
 mod paintable;
@@ -283,6 +285,8 @@ fn main() -> glib::ExitCode {
     let theme_monitor = RefCell::new(None);
     app.connect_startup(move |_| {
         gtk::Window::set_default_icon_name(APP_NAME);
+        #[cfg(target_os = "macos")]
+        macos_fullscreen::hide_menu_bar_in_fullscreen();
         *theme_monitor.borrow_mut() = theme::follow_omarchy_theme();
     });
     app.connect_activate(move |app| build_ui(app, &cli));
@@ -498,6 +502,7 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         &header,
         &fullscreen_btn,
         &entry,
+        &video,
     );
 
     let ui = Rc::new(App {
@@ -545,6 +550,9 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
     refresh_tabs(&ui);
 
     // Fullscreen toggle.
+    #[cfg(target_os = "macos")]
+    fullscreen_btn.connect_toggled(|b| macos_fullscreen::set(b.is_active()));
+    #[cfg(not(target_os = "macos"))]
     {
         let window = window.clone();
         fullscreen_btn.connect_toggled(move |b| {
@@ -2243,7 +2251,9 @@ fn install_input_handlers(
 
 /// In fullscreen the header leaves the layout, so the picture gets the whole
 /// screen, and slides in over it while the pointer is at the top edge. The header stays while the address bar is in use, so
-/// it does not slide away under a half-typed machine.
+/// it does not slide away under a half-typed machine. While the picture has
+/// the keyboard the top edge belongs to the remote, whose own bar sits
+/// there; the release hotkey hands it back to the header.
 fn install_fullscreen_bars(
     window: &adw::ApplicationWindow,
     content: &gtk::Box,
@@ -2251,6 +2261,7 @@ fn install_fullscreen_bars(
     header: &adw::HeaderBar,
     fullscreen_btn: &gtk::ToggleButton,
     entry: &gtk::Entry,
+    video: &gtk::Widget,
 ) {
     let address_bar_in_use = {
         let (window, entry) = (window.clone(), entry.clone());
@@ -2262,15 +2273,22 @@ fn install_fullscreen_bars(
         .build();
     overlay.add_overlay(&top);
 
+    // The button is the fullscreen state: on macOS it fills the screen
+    // without GTK's fullscreen (see `macos_fullscreen`), and elsewhere it
+    // follows the window, whoever fullscreened it.
     {
-        let (content, header) = (content.clone(), header.clone());
-        let (top, fullscreen_btn) = (top.clone(), fullscreen_btn.clone());
+        let fullscreen_btn = fullscreen_btn.clone();
         window.connect_fullscreened_notify(move |w| {
             let full = w.is_fullscreen();
             if fullscreen_btn.is_active() != full {
                 fullscreen_btn.set_active(full);
             }
-            if full {
+        });
+    }
+    {
+        let (content, header, top) = (content.clone(), header.clone(), top.clone());
+        fullscreen_btn.connect_toggled(move |b| {
+            if b.is_active() {
                 content.remove(&header);
                 top.set_child(Some(&header));
             } else {
@@ -2285,13 +2303,14 @@ fn install_fullscreen_bars(
     const LEAVE_MARGIN: f64 = 8.0;
     let motion = gtk::EventControllerMotion::new();
     {
-        let (window, header, top) = (window.clone(), header.clone(), top.clone());
+        let (fullscreen_btn, header, top) = (fullscreen_btn.clone(), header.clone(), top.clone());
+        let video = video.clone();
         let address_bar_in_use = address_bar_in_use.clone();
         motion.connect_motion(move |_, _, y| {
-            if !window.is_fullscreen() {
+            if !fullscreen_btn.is_active() {
                 return;
             }
-            if y <= EDGE {
+            if y <= EDGE && !video.has_focus() {
                 top.set_reveal_child(true);
             } else if top.reveals_child()
                 && y > header.height() as f64 + LEAVE_MARGIN
@@ -2316,8 +2335,9 @@ fn install_fullscreen_bars(
     // event; hide the header then, unless the pointer still rests on it.
     {
         let (window, top, header) = (window.clone(), top.clone(), header.clone());
+        let fullscreen_btn = fullscreen_btn.clone();
         window.clone().connect_focus_widget_notify(move |_| {
-            if !window.is_fullscreen() || address_bar_in_use() {
+            if !fullscreen_btn.is_active() || address_bar_in_use() {
                 return;
             }
             let pointer_on_header = WidgetExt::display(&window)

@@ -86,7 +86,12 @@ impl Bridge {
                         return;
                     }
                 }
-                self.transfers.refuse(id);
+                // A request for an offer since replaced is stale, not a failure.
+                if serial == self.serial.get() {
+                    self.transfers.refuse(id);
+                } else {
+                    self.transfers.refuse_stale(id);
+                }
             }
             None => {}
         }

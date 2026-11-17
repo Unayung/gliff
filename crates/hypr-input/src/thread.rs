@@ -342,7 +342,6 @@ impl LoopState for State {
                 } else {
                     wl_pointer::AxisSource::Finger
                 };
-                self.pointer.axis_source(source);
                 if stop {
                     self.pointer.axis_stop(t, a);
                 } else if let Some(d) = discrete {
@@ -350,6 +349,11 @@ impl LoopState for State {
                 } else {
                     self.pointer.axis(t, a, value);
                 }
+                // After the axis, not before: Hyprland starts a fresh event
+                // (source wheel) on every `axis` and writes the source into
+                // the event of the last axis named, so a source sent first
+                // is dropped or lands on the other axis.
+                self.pointer.axis_source(source);
                 self.pointer.frame();
             }
             InputCmd::SetKeymap(text) if text == self.keys.text => {}

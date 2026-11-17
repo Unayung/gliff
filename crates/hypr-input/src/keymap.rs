@@ -254,6 +254,27 @@ mod tests {
     }
 
     #[test]
+    fn set_locks_clears_and_leaves_other_locks_and_the_layout() {
+        let text = keymap_from_names(&KeymapNames {
+            layout: "us,de".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut ks = KeyState::from_text(&text).unwrap();
+        let bit = |ks: &KeyState, name| 1 << ks.keymap.mod_get_index(name);
+        let (caps, num, mod5) = (
+            bit(&ks, xkb::MOD_NAME_CAPS),
+            bit(&ks, xkb::MOD_NAME_NUM),
+            bit(&ks, "Mod5"),
+        );
+        ks.state.update_mask(0, 0, mod5, 0, 0, 1);
+        let mods = ks.set_locks(true, true).expect("both locks change mods");
+        assert_eq!((mods.2, mods.3), (caps | num | mod5, 1));
+        let mods = ks.set_locks(false, false).expect("clearing changes mods");
+        assert_eq!((mods.2, mods.3), (mod5, 1));
+    }
+
+    #[test]
     fn carry_over_keeps_locks_and_held_keys() {
         const KEY_CAPSLOCK: u32 = 58;
         const KEY_LEFTCTRL: u32 = 29;
